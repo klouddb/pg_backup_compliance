@@ -68,12 +68,12 @@ CREATE EXTENSION pg_backup_compliance;
 
     1. Ensure the original pgbackrest binary exists at: /usr/bin/pgbackrest
     
-    2. Install the extension
+    2. Run below command(for pgbackrest integration)
 
-    ```
+   
         sudo make pgbackrest_install
 
-    ```
+  
 
 
 ## Backup Reports(Built-in Views)
