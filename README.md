@@ -19,15 +19,6 @@ Backup compliance plays a critical role in security and regulatory audits becaus
 
 
 
-## pg_backup_compliance extension
-
-This extension tracks calls of pg_dump, pg_dumpall, pg_basebackup, and pgBackRest from inside PostgreSQL.
-
-The logs are stored in a database named backupcompliance, which is created when the extension is created.
-A separate database is chosen because pg_basebackup, pg_dumpall, and pgbackrest are cluster-level commands and run across the entire cluster. Keeping data in a separate global database ensures that the whole server remains updated when running a global command.
-
-** Admins can access all backup operation logs from the table backup_operations_log inside the backupcompliance database. 
-
 ## Requirement
 
 ** A database named `backupcompliance` is needed by the extension
