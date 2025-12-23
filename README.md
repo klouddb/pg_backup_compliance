@@ -70,15 +70,6 @@ shared_preload_libraries = 'pg_backup_compliance'
 CREATE EXTENSION pg_backup_compliance;
 
 ```
-# critical point
-If extension dont create schema or views or any problem. Always repeat setup steps, especially restart potgresql again.
-
-Now, when pg_dump, pg_basebackup, or pg_dumpall are executed, extra logs will appear in database backupcompliance, table backup_operations_log.
-
-
-
-
-In pg_basebackup, your user <backup_user> must have replication permissions and backup permissions, so register it with backup/replication permissions
 
 ##  For pgbackrest integration
 
