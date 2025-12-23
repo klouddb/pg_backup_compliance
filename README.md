@@ -19,9 +19,9 @@ Backup compliance plays a critical role in security and regulatory audits becaus
 
 
 
-## Requirement
+## Compile and Install
 
-** A database named `backupcompliance` is needed by the extension
+A database named `backupcompliance` is needed by the extension
 
 
 Run this command via psql, or directly in your pgadmin
@@ -31,8 +31,6 @@ Run this command via psql, or directly in your pgadmin
 
 ```
 
-
-## Setup
 
 1. Clone the extension
 
@@ -65,11 +63,22 @@ shared_preload_libraries = 'pg_backup_compliance'
 
 5. Create the extension on the database to be tracked
 
+NOTE - A database named `backupcompliance` is needed by the extension
+
+
+Create database before installing extension
+
+```
+    CREATE DATABASE backupcompliance;
+
+```
+
 ```
 
 CREATE EXTENSION pg_backup_compliance;
 
 ```
+
 
 ##  For pgbackrest integration
 
