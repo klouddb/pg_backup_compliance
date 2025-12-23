@@ -81,20 +81,8 @@ CREATE EXTENSION pg_backup_compliance;
 
     ```
 
-    3. In `postgresql.conf` file set. These may be already set. If these are already set, please change/replace if any command is not there or not matched.
-    
-    ```
 
-        archive_mode = on
-        archive_command = 'pgbackrest --stanza=<your staza> archive-push %p'
-        wal_level = replica
-        max_wal_senders = 3
-
-    ```
-
----
-
-## Views Available
+## Backup Reports(Built-in Views)
 
 1. v_quarterly_backups          --> provides backups from last three months from now()
 2. v_monthly_backups            --> provides backups from last months from now()
@@ -102,11 +90,5 @@ CREATE EXTENSION pg_backup_compliance;
 4. v_quarterly_failed_backups   -->  provides failed backups from last three months from now()
 5. v_monthly_failed_backups     --> provides failed backups from last months from now()
 
-## 📌 Notes
-
-- All time-based views compute date ranges using `now()` at query time.
-- Failed views include only operations recorded as "error is not empty".
-
----
 
 
