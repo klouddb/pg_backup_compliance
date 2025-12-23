@@ -2,7 +2,7 @@
 
 Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
 
-NOTE - Use this extension along with KloudDB Shield to secure your Postgres Servers . KloudDB Shield serves as a comprehensive security tool designed specifically for Postgres databases, conducting
+NOTE - Use this extension along with KloudDB Shield to secure your Postgres Servers . KloudDB Shield serves as a comprehensive security tool designed specifically for Postgres databases https://github.com/klouddb/klouddbshield
 
 ## Why Do You Need This Extension for Backup Compliance?
 
