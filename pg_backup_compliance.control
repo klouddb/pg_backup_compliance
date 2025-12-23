@@ -1,0 +1,6 @@
+# pg_backup_compliance.control
+comment = 'Extension to log entries for pg_dump, pg_dumpall, pg_basebackup, and pgbackrest'
+default_version = '1.0'
+relocatable = false
+module_pathname = '$libdir/pg_backup_compliance'   # MODULE_big name
+superuser = true
