@@ -66,9 +66,8 @@ CREATE EXTENSION pg_backup_compliance;
 
 ##  For pgbackrest integration
 
-    1. Ensure that original pgbackrest binary exists at: /usr/bin/pgbackrest
-    
-    2. Run below command(for pgbackrest integration)
+   
+    1. Run below command(for pgbackrest integration)
 
    
         sudo make pgbackrest_install
