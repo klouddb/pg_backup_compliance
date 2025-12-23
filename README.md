@@ -1,3 +1,19 @@
+
+
+Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery to ensure business continuity, data integrity, and resilience against data loss, ransomware, or disaster events.
+
+## Why Do You Need This Extension for Backup Compliance?
+
+In security and compliance frameworks such as ISO 27001, NIST, and HIPAA, organizations must maintain tamper-evident evidence proving that backups are being performed as required. This extension provides auditable records that serve as backup compliance proof.
+While it is possible to track pgBackRest, pg_basebackup, and pg_dump individually, there is no easy way to automatically and consistently track all three utilities together.
+One of the major security risks is unauthorized database exports using pg_dump. Tracking all backup and dump activity is critical for audits and for detecting potential data exfiltration.
+This extension includes built-in views that generate monthly and quarterly compliance reports, making audits significantly easier.
+Although backup activity can be inferred from logs, that evidence may be rotated or lost over time. This extension stores the evidence centrally and persistently.
+With this extension, you can quickly identify successful and failed backups across all supported tools for any given time period
+
+
+
+
 ## pg_backup_compliance extension
 
 This extension tracks calls of pg_dump, pg_dumpall, pg_basebackup, and pgBackRest from inside PostgreSQL.
