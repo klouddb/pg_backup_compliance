@@ -35,7 +35,7 @@ sudo make install
 ```
 
 
-3. Add following to postgresql.conf
+3. Add following to postgresql.conf and restart Postgres
 
 ```
 
@@ -43,15 +43,9 @@ shared_preload_libraries = 'pg_backup_compliance'
 
 ```
 
-4. Restart the server 
-
-```
-    sudo systemctl restart postgresql@<version>-main
-
-```
 
 
-5. Create the extension on the database to be tracked
+4. Create the extension on the database to be tracked
 
 NOTE - A database named `backupcompliance` is needed by the extension
 
