@@ -21,16 +21,6 @@ Backup compliance plays a critical role in security and regulatory audits becaus
 
 ## Compile and Install
 
-A database named `backupcompliance` is needed by the extension
-
-
-Run this command via psql, or directly in your pgadmin
-
-```
-    CREATE DATABASE backupcompliance;
-
-```
-
 
 1. Clone the extension
 
