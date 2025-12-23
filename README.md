@@ -53,7 +53,7 @@ NOTE - A database named `backupcompliance` is needed by the extension
 Create database before installing extension
 
 ```
-    CREATE DATABASE backupcompliance;
+CREATE DATABASE backupcompliance;
 
 ```
 
