@@ -85,5 +85,8 @@ CREATE EXTENSION pg_backup_compliance;
 4. v_quarterly_failed_backups   -->  provides failed backups from last three months from now()
 5. v_monthly_failed_backups     --> provides failed backups from last months from now()
 
+## Help
+Please reach us at support@klouddb.io
+
 
 
