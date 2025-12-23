@@ -1,6 +1,6 @@
 
 
-Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery to ensure business continuity, data integrity, and resilience against data loss, ransomware, or disaster events.
+Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
 
 ## Why Do You Need This Extension for Backup Compliance?
 
@@ -13,7 +13,8 @@ Backup compliance plays a critical role in security and regulatory audits becaus
 4. This extension includes built-in views that generate monthly and quarterly compliance reports, making audits significantly easier.
 
 5. Although backup activity can be inferred from logs, that evidence may be rotated or lost over time. This extension stores the evidence centrally and persistently.
-With this extension, you can quickly identify successful and failed backups across all supported tools for any given time period
+
+6. With this extension, you can quickly identify successful and failed backups across all supported tools for any given time period
 
 
 
@@ -83,31 +84,7 @@ If extension dont create schema or views or any problem. Always repeat setup ste
 
 Now, when pg_dump, pg_basebackup, or pg_dumpall are executed, extra logs will appear in database backupcompliance, table backup_operations_log.
 
-## Example commands(may differ for different environments/paths)
 
-1. pg_dump example command
-
-```
-
-sudo -u postgres pg_dump <database_name> > dump.sql
-
-```
-
-2. pg_basebackup example command 
-
-```
-
-   pg_basebackup -h <server_name> -p 5432 -U <backup_user> -D /tmp/pg_backup_test_2 -F tar -X fetch -P
- 
-```
-
-3. pg_dumpall example command
-
-```
-
-    sudo -u postgres pg_dumpall > dumpall.sql
-
-```
 
 
 In pg_basebackup, your user <backup_user> must have replication permissions and backup permissions, so register it with backup/replication permissions
