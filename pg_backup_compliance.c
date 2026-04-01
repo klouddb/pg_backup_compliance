@@ -5,6 +5,8 @@
 #include "utils/builtins.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
+#include "access/xact.h"    /* Required for Transaction Status */
+#include "tcop/tcopprot.h"  /* Required for QueryCancelPending */
 #include "tcop/utility.h"
 #include "libpq/auth.h"
 #include "miscadmin.h"
@@ -27,7 +29,7 @@
 #include "utils/memutils.h"
 #include "commands/extension.h"
 #include "utils/snapmgr.h"
-
+#include "executor/executor.h"
 
 // ----------------------------------------------
 // Required ADDITIONS for Background Worker
@@ -64,9 +66,14 @@ PG_MODULE_MAGIC;
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup  = false;
 
+
 // #define PGAUD_PROC_SIGNAL PROCSIG_STARTUP_DEADLOCK
 #define PGAUD_PROC_SIGNAL 0
 // static bool tables_created = false;
+
+
+void _PG_fini(void);
+void _PG_init(void);
 
 /* forward declarations for dump hook module */
 extern void _PG_init_dump(void);
@@ -88,6 +95,8 @@ void pgaud_run_views_schema(void);
 
 void insert_into_log_immediate(const char *app, const char *db, int pid,
                           const char *start_time, const char *end_time, const char *err);
+                         
+bool is_inherited_from_active_job(const char *app_name, const char *client_addr);
 
 /* ----------------- Backgroud worker configuration ---------------------------- */
 
@@ -164,6 +173,7 @@ static void pgaud_shmem_request(void);
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static emit_log_hook_type prev_emit_log_hook = NULL;
+
 
 // Escape single quotes: ' -> '' into dst (dst_size must be >0).
 // SQL dont allow '. e.g.  this's is not allowed. It should be this''s.
@@ -333,6 +343,7 @@ pgaud_dequeue_job(PGAudJob *out)
     return ok;
 }
 
+
 // insert_into_log_immediate - this prepares data and puts it into 
 // shared memory and then sends a signal to wake up the worker 
 void insert_into_log_immediate(const char *app, const char *db, int pid,
@@ -408,27 +419,42 @@ void insert_into_log_immediate(const char *app, const char *db, int pid,
 static void
 pgaud_emit_log_hook(ErrorData *edata)
 {
-    static bool in_hook;
+    static bool in_hook = false;
     const char *app;
     // 1. Call the previous hook in the chain if it exists 
     if (prev_emit_log_hook)
         prev_emit_log_hook(edata);
 
     // 2. Recursion Guard: Prevent infinite loops if our logic errors out 
-    in_hook = false;
+    // in_hook = false;
+    // elog(LOG, "[pg_backup_compliance_dump] In emit_log_hook with elevel=%d", edata->elevel);
+    write_stderr("[pgaud_dump] In emit_log_hook with elevel=%d\n", edata->elevel);
     if (in_hook)
         return;
 
-    // 3. Filter: Only process ERROR, FATAL, or PANIC 
-    if (edata->elevel < ERROR)
+    
+    // 3. Filter: Only process ERROR, FATAL, or PANIC
+    /* Inside your log hook */
+
+ 
+    if (edata->elevel >= ERROR || 
+        (edata->message && strstr(edata->message, "terminating connection due to administrator command")) ||
+        (edata->message && strstr(edata->message, "aborted")))
+    {
+        /* Mark this row as having an error in your table */
+    } 
+    else if (edata->elevel < ERROR)
         return;
 
     in_hook = true;
+    // write_stderr("[pgaud_dump] In emit_log_hook with elevel=%d qnd now writing.\n", edata->elevel);
 
     // 4. Filter: Only process specific applications (pg_dump / pg_basebackup) 
     app = (MyProcPort && MyProcPort->application_name)
                         ? MyProcPort->application_name
                         : "";
+    
+    // write_stderr("[pgaud_dump] Application name in emit_log_hook: %s\n", app);
 
     if (strncmp(app, "pg_dump", 7) == 0 || strncmp(app, "pg_basebackup", 13) == 0)
     {
@@ -438,7 +464,7 @@ pgaud_emit_log_hook(ErrorData *edata)
         const char *now_str;
 
         // Safe database name lookup 
-        db = (OidIsValid(MyDatabaseId)) ? get_database_name(MyDatabaseId) : "[no db]";
+        db = (OidIsValid(MyDatabaseId)) ? get_database_name(MyDatabaseId) : "";
 
         memset(&job, 0, sizeof(PGAudJob));
         job.job_type = PGAUD_JOB_BACKUP_LOG;
@@ -479,6 +505,7 @@ pgaud_emit_log_hook(ErrorData *edata)
 
     in_hook = false;
 }
+
 
 
 // Handle a backup log job: insert or update the log entry.
@@ -744,12 +771,14 @@ pgaud_schema_exists(void)
 }
 
 
+
 void
 pgaud_worker_main(Datum arg)
 {
     int rc;
     PGAudJob job;
     bool schema_initialized = false;
+    // TimestampTz last_cleanup = GetCurrentTimestamp();
 
     pqsignal(SIGHUP, pgaud_bgw_sighup);
     pqsignal(SIGTERM, pgaud_bgw_sigterm);
@@ -819,6 +848,26 @@ pgaud_worker_main(Datum arg)
             }
             PG_END_TRY();
         }
+
+        // if (GetCurrentTimestamp() - last_cleanup > 30 * 1000000L)
+        // {
+           
+        //     PG_TRY();
+        //     {
+        //         StartTransactionCommand();
+        //         PushActiveSnapshot(GetTransactionSnapshot()); // REQUIRED for CTE
+        //         pgaud_clean_up_basebackup_c();
+        //         PopActiveSnapshot();
+        //         CommitTransactionCommand();
+        //         last_cleanup=GetCurrentTimestamp();
+        //     }
+        //     PG_CATCH();
+        //     {
+        //         AbortCurrentTransaction();
+        //         FlushErrorState();
+        //     }
+        //     PG_END_TRY();
+        // }
 
         /* ---- PROCESS JOBS ---- */
         while (pgaud_dequeue_job(&job))
@@ -890,7 +939,6 @@ pgaud_worker_main(Datum arg)
 }
 
 
-
 // This function checks if backupcompliance database is available or not
 // If not found cretes the datatabase
 // Similarly, it creates two tables, backup_operations_log and pgbackrest_logs
@@ -940,6 +988,8 @@ _PG_init(void)
     // shared memory startup hook
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = pgaud_shmem_startup;
+
+    // Executor hook for dump commands
     
     
     // GUC to enable/disable the bgworker logging

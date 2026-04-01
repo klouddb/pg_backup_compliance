@@ -320,10 +320,21 @@ run_cmd() {
     fi
 }
 
+
 echo "=== Compiling pgBackRest Wrapper ==="
+
+echo "-- Remove this pgbackrest binary using 'sudo rm -f /usr/local/bin/pgbackrest'--"
+
+PG_CONFIG=$(command -v pg_config || true)
+
+if [ -z "$PG_CONFIG" ] || [ ! -x "$PG_CONFIG" ]; then
+    echo "pg_config not found. Please ensure PostgreSQL Dev package is installed and pg_config is in your PATH."
+    exit 1
+fi
+
 gcc pgbackrest_wrapper.c \
-  -I$(pg_config --includedir) \
-  -L$(pg_config --libdir) \
+  -I$($PG_CONFIG --includedir) \
+  -L$($PG_CONFIG --libdir) \
   -lpq \
   -o pgbackrest_bin
 

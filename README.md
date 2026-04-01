@@ -2,8 +2,6 @@
 
 Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
 
-NOTE - Use this extension along with KloudDB Shield to secure your Postgres Servers . KloudDB Shield serves as a comprehensive security tool designed specifically for Postgres databases https://github.com/klouddb/klouddbshield
-
 ## Why Do You Need This Extension for Backup Compliance?
 
 1. In security and compliance frameworks such as ISO 27001, NIST, and HIPAA, organizations must maintain tamper-evident evidence proving that backups are being performed as required. This extension provides auditable records that serve as backup compliance proof.
@@ -68,8 +66,9 @@ CREATE EXTENSION pg_backup_compliance;
 
 ##  For pgbackrest integration
 
-   
-    1. Run below command(for pgbackrest integration)
+    1. Ensure the original pgbackrest binary exists at: /usr/bin/pgbackrest
+    
+    2. Run below command(for pgbackrest integration)
 
    
         sudo make pgbackrest_install
@@ -84,9 +83,6 @@ CREATE EXTENSION pg_backup_compliance;
 3. v_failed_backups             --> provides all failed backup attempts. 
 4. v_quarterly_failed_backups   -->  provides failed backups from last three months from now()
 5. v_monthly_failed_backups     --> provides failed backups from last months from now()
-
-## Help
-Please reach us at support@klouddb.io
 
 
 
