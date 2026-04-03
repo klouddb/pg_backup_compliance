@@ -33,7 +33,9 @@ make
 sudo make install
 
 ```
+NOTE - You might need dependent packages (for e.g ubuntu below)
 
+apt install postgresql-server-dev-17 libkrb5-dev
 
 3. Add following to postgresql.conf and restart Postgres
 
