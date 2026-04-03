@@ -33,7 +33,7 @@ make
 sudo make install
 
 ```
-NOTE - You might need dependent packages (for e.g ubuntu below)
+NOTE - You may need to install dependent packages (for example, on Ubuntu as shown below)
 
 apt install postgresql-server-dev-17 libkrb5-dev
 
