@@ -2,6 +2,8 @@
 
 Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
 
+Pair this extension with KloudDB Shield for stronger, defense-in-depth security https://klouddb.gitbook.io/klouddb_shield
+
 ## Why Do You Need This Extension for Backup Compliance?
 
 1. In security and compliance frameworks such as ISO 27001, NIST, and HIPAA, organizations must maintain tamper-evident evidence proving that backups are being performed as required. This extension provides auditable records that serve as backup compliance proof.
