@@ -2,7 +2,7 @@
 
 Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
 
-Pair this extension with KloudDB Shield for stronger, defense-in-depth security https://klouddb.gitbook.io/klouddb_shield
+Strengthen your security posture with KloudDB Shield + pg_backup_compliance https://klouddb.gitbook.io/klouddb_shield
 
 ## Why Do You Need This Extension for Backup Compliance?
 
