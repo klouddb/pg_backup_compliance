@@ -79,7 +79,14 @@ CREATE EXTENSION pg_backup_compliance;
 
   
 
+***
 
+In views for failed backups, I am assuming that backups having something written in their error columns 
+are failed backups. This is because, we are not mantaining status column to tell, if it is a failed or successful 
+backup. 
+In future, we will add that column for the same to directly read that column for successful and failed backups.So, now, if something got written in those column in some case, then it can be classified as failed backup.
+
+***
 ## Backup Reports(Built-in Views)
 
 1. v_quarterly_backups          --> provides backups from last three months from now()

@@ -852,8 +852,54 @@ int main(int argc, char **argv)
         ? WEXITSTATUS(status)
         : 128 + WTERMSIG(status);
 
-    if(method && strcmp(method,"backup")==0)
-    audit_insert("pgbackrest", start_ts, end_ts, exit_code, error_buf, getpid());
+    /* --- NEW LOGIC: Format a compact error message based on exit status --- */
+    char compact_error[ERROR_BUF_SIZE] = {0};
+
+    if (exit_code == 0) 
+    {
+        // 1. Successful run -> Leave error message completely empty
+        compact_error[0] = '\0';
+    } 
+    else 
+    {
+        // 2. Failed run -> Find the "ERROR: " line from pgbackrest
+        char *err_line = strstr(error_buf, "ERROR: ");
+        
+        if (err_line != NULL) 
+        {
+            // Extract only up to the newline character
+            char *newline = strchr(err_line, '\n');
+            if (newline != NULL) 
+            {
+                int line_len = newline - err_line;
+                snprintf(compact_error, sizeof(compact_error), "%.*s", line_len, err_line);
+            } 
+            else 
+            {
+                // No newline found, just copy the rest of the string
+                snprintf(compact_error, sizeof(compact_error), "%s", err_line);
+            }
+        } 
+        else 
+        {
+            // Fallback: If "ERROR:" keyword isn't found, take the last ~200 chars
+            int len = strlen(error_buf);
+            if (len > 200) 
+            {
+                snprintf(compact_error, sizeof(compact_error), "...%s", error_buf + len - 197);
+            } 
+            else 
+            {
+                snprintf(compact_error, sizeof(compact_error), "%s", error_buf);
+            }
+        }
+    }
+    /* ---------------------------------------------------------------------- */
+
+    if(method && strcmp(method,"backup")==0) {
+        // Pass 'compact_error' instead of 'error_buf'
+        audit_insert("pgbackrest", start_ts, end_ts, exit_code, compact_error, getpid());
+    }
 
     return exit_code;
 }
