@@ -2,7 +2,7 @@
 
 A PostgreSQL extension that records every backup-related session against
 the server -- `pg_dump`, `pg_dumpall`, `pg_basebackup`, `pgBackRest`,
-`pg_probackup`, and any tool that calls the backup
+ and any tool that calls the backup
 SQL API -- and exposes the captures as SQL views.
 
 ## Features
