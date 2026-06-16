@@ -1,1039 +1,1307 @@
+/*-------------------------------------------------------------------------
+ *
+ * pg_backup_compliance.c
+ *    Records backup-related sessions into a shared-memory hash table and
+ *    persists state across restarts via a dump file in $PGDATA/pg_stat/.
+ *    The captured rows are exposed through a set-returning function and
+ *    a set of views built on top of it.
+ *
+ * Portions of the shared-memory and dump-file handling are derived from
+ * the PostgreSQL pg_stat_statements contrib module.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, The Regents of the University of California
+ * Copyright (c) 2024-2026, KloudDB.
+ *
+ * IDENTIFICATION
+ *    pg_backup_compliance.c
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
-#include "fmgr.h"
-#include "executor/spi.h"
-#include "miscadmin.h"
-#include "utils/builtins.h"
-#include "catalog/pg_database.h"
-#include "catalog/pg_database_d.h"
-#include "access/xact.h"    /* Required for Transaction Status */
-#include "tcop/tcopprot.h"  /* Required for QueryCancelPending */
-#include "tcop/utility.h"
-#include "libpq/auth.h"
-#include "miscadmin.h"
-#include "utils/guc.h"
-#include "utils/builtins.h"
-#include "catalog/pg_database.h"
-#include "catalog/pg_database_d.h"
-#include "storage/proc.h"
-#include "utils/timestamp.h"
-#include "utils/lsyscache.h"      // for get_database_name()
-#include "catalog/catalog.h"
-#include "catalog/namespace.h"
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <sys/file.h>
+
 #include <unistd.h>
-#include <stdio.h>
-#include "utils/elog.h"
-#include "utils/memutils.h"
-#include "commands/extension.h"
-#include "utils/snapmgr.h"
-#include "executor/executor.h"
+#include <sys/stat.h>
 
-// ----------------------------------------------
-// Required ADDITIONS for Background Worker
-// ----------------------------------------------
-#include "postmaster/bgworker.h"     // Background worker
-#include "storage/ipc.h"             // for on_proc_exit
-#include "storage/latch.h"           // WaitLatch
-#include "storage/lwlock.h"          // LWLocks
-#include "storage/shmem.h"           // shared memory API
-#include "storage/dsm.h"             // dynamic shared memory (if used)
-#include "storage/sinval.h"          // sinval handling in workers
-#include "storage/spin.h"            // spinlocks
-#include "storage/procsignal.h"      // for procsignal
-#include "storage/pmsignal.h"        // PMSignal support
-#include "utils/ps_status.h"         // set_ps_display()
-#include "access/xact.h"             // StartTransaction/CommitTransaction
-#include "access/xlog.h"             // XLogFlush
-#include "tcop/tcopprot.h"           // ProcessUtilityHook
-#include <signal.h>
-
-//for database creation
-#include "utils/syscache.h"
-#include "nodes/parsenodes.h"
+#include "access/htup_details.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "pgstat.h"
+#include "storage/fd.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
-#include "commands/dbcommands.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
+#include "utils/timestamp.h"
 
-#if PG_VERSION_NUM >= 170000
-#include "parser/parse_node.h"
-#endif
-
+#include "pg_backup_compliance.h"
 
 PG_MODULE_MAGIC;
 
-static volatile sig_atomic_t got_sigterm = false;
-static volatile sig_atomic_t got_sighup  = false;
+/* GUC variables */
+bool        pgbc_enabled = true;
+bool        pgbc_save = true;
+int         pgbc_max_entries = 1024;
+char       *pgbc_track_apps = NULL;
 
+/* Shared state pointers. */
+pgbcSharedState *pgbc_state = NULL;
+HTAB            *pgbc_hash = NULL;
 
-// #define PGAUD_PROC_SIGNAL PROCSIG_STARTUP_DEADLOCK
-#define PGAUD_PROC_SIGNAL 0
-// static bool tables_created = false;
-
-
-void _PG_fini(void);
-void _PG_init(void);
-
-/* forward declarations for dump hook module */
-extern void _PG_init_dump(void);
-extern void _PG_fini_dump(void);
-// static void pgaud_exit_hook(int code, Datum arg);
-
-extern char *get_database_name(Oid dbid);
-extern Oid get_database_oid(const char *dbname, bool missing_ok);
-extern Oid get_role_oid(const char *rolename, bool missing_ok);
-
-PG_FUNCTION_INFO_V1(pgaud_init);
-Datum pgaud_init(PG_FUNCTION_ARGS);
-
-// static ErrorContextCallback pgaud_error_context;
-// static void pgaud_error_callback(void *arg);
-void pgaud_run_schema(void);
-void pgaud_run_views_schema(void);
-// void (*prev_emit_log_hook)(ErrorData *edata) = NULL;
-
-void insert_into_log_immediate(const char *app, const char *db, int pid,
-                          const char *start_time, const char *end_time, const char *err);
-                         
-bool is_inherited_from_active_job(const char *app_name, const char *client_addr);
-
-/* ----------------- Backgroud worker configuration ---------------------------- */
-
-#define PGAUD_QUEUE_SLOTS 256
-#define PGAUD_APP_LEN     128
-#define PGAUD_DB_LEN      128
-#define PGAUD_TIME_LEN    64
-#define PGAUD_ERR_LEN     1024
-
-// job types - This denotes various job bg worker will do
-// created switch-case block in worker call function 
-// and this variable can be used to denote various task in switch-case
-#define PGAUD_JOB_BACKUP_LOG 1
-#define PGAUD_JOB_SCHEMA_CREATE 2
-
-// polling interval for worker (ms) 
-#define PGAUD_WORKER_POLL_MS 500 
-
-#define BACKUP_DATABASE "backupcompliance"
-
-//GUC to enable/disable the bgworker logging
-
-// bool pgaud_enabled = true;
-// bool schema_initialized = false;
-
-/* ----------------------------- shared types ------------------------------ */
-
-
-// creating a job which is basically a stack of all the data
-// we want to put into table for one row.
-typedef struct
-{
-    int job_type;  
-    char application[PGAUD_APP_LEN];
-    char database[PGAUD_DB_LEN];
-    int  pid;
-    char start_time[PGAUD_TIME_LEN];
-    char end_time[PGAUD_TIME_LEN];
-    char err[PGAUD_ERR_LEN];  // dont forget to escape single quote
-    char client_addr[PGAUD_ERR_LEN];
-} PGAudJob;
-
-
-// This is shared memory queue.
-// This is a circular queue, we can write various jobs onto it
-// Worker will take the job data from it and will insert into table.
-typedef struct
-{
-    slock_t lock;           // spinlock for head/tail + jobs 
-    int head;               // next free slot index 
-    int tail;               // first occupied slot index 
-    PGAudJob jobs[PGAUD_QUEUE_SLOTS];
-    pid_t worker_pid;       // bgworker pid when running 
-} PGAudSharedState;
-
-
-// WaitLatch wait-mode: use PG_WAIT_EXTENSION if available, otherwise 0 
-//Although not required as this is harcoded in code below
-// but kept it for future improvement and function generic
-#ifndef PG_WAIT_EXTENSION
-#define PG_WAIT_EXTENSION 0
-#endif
-
-
-// global pointer to SHM state. 
-// This tells us if our global state is set, 
-// so that we ca use and no error is thrown
-static PGAudSharedState *pgaud_state = NULL;
-
-static void pgaud_shmem_startup(void);
-PGDLLEXPORT void pgaud_worker_main(Datum main_arg);
-static void pgaud_shmem_request(void);
-
+/* Previous shmem hook chain. */
+#if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-static emit_log_hook_type prev_emit_log_hook = NULL;
 
-
-// Escape single quotes: ' -> '' into dst (dst_size must be >0).
-// SQL dont allow '. e.g.  this's is not allowed. It should be this''s.
-static void
-escape_single_quotes(const char *src, char *dst, size_t dst_size)
-{
-    size_t i = 0, j = 0;
-    if (!dst || dst_size == 0)
-        return;
-    if (!src)
-    {
-        dst[0] = '\0';
-        return;
-    }
-
-    while (src[i] != '\0' && j + 1 < dst_size)
-    {
-        if (src[i] == '\'')
-        {
-            // need two chars for "''" 
-            if (j + 2 >= dst_size)
-                break;
-            dst[j++] = '\'';
-            dst[j++] = '\'';
-        }
-        else
-            dst[j++] = src[i];
-        i++;
-    }
-    dst[j] = '\0';
-}
-
-
-
-// Format current timestamptz into buf.
-static void
-format_now_timestamp(char *buf, size_t buf_size)
-{
-    TimestampTz now = GetCurrentTimestamp();
-    const char *s = timestamptz_to_str(now);
-    strlcpy(buf, s, buf_size);
-}
-
-//check if database exists
-static
-bool
-database_exists(const char *dbname)
-{
-    bool exists = false;
-    int rc;
-
-    if (SPI_connect() != SPI_OK_CONNECT)
-        elog(ERROR, "SPI_connect failed");
-
-    rc = SPI_execute(
-    "SELECT 1 FROM pg_database WHERE datname = 'backupcompliance'",
-    true,
-    0
-    );
-    if (rc == SPI_OK_SELECT && SPI_processed > 0)
-        exists = true;
-
-    SPI_finish();
-    return exists;
-}
-
-
-
-//Initializing shmem-queue to put jobs 
-static void
-pgaud_shmem_startup(void)
-{
-    bool found;
-
-    if (prev_shmem_startup_hook)
-        prev_shmem_startup_hook();
-
-    pgaud_state = (PGAudSharedState *)
-        ShmemInitStruct("pgaud_shared_state",
-                        sizeof(PGAudSharedState),
-                        &found);
-
-    if (!found)
-    {
-        SpinLockInit(&pgaud_state->lock);
-        pgaud_state->head = 0;
-        pgaud_state->tail = 0;
-        pgaud_state->worker_pid = 0;
-        MemSet(pgaud_state->jobs, 0, sizeof(pgaud_state->jobs));
-    }
-}
-
-
-static void
-pgaud_shmem_request(void)
-{
-    /* Request the shared memory size and LWLock tranche here.
-     * This runs at the correct time during server startup.
-     */
-    RequestAddinShmemSpace(sizeof(PGAudSharedState));
-    RequestNamedLWLockTranche("pgaud_queue_tranche", 1);
-
-    /* chain previous hook if present */
-    if (prev_shmem_request_hook)
-        prev_shmem_request_hook();
-}
-
-
-// Enqueue job into ring buffer.
-// Safe for error-hook usage: uses only SpinLock and stack buffers.
-// Used Spinlock because i thought, it is safe for small work
-// For large work can use LWLock
-//Spinlock can not be used in the situation where process will sleep.
-// Returns true on success, false if queue full.
-static bool
-pgaud_enqueue_job(const PGAudJob *job)
-{
-    bool ok = false;
-    int next;
-    // If SHM not ready, drop quietly and log  
-    if (!pgaud_state)
-        return false;
-
-    SpinLockAcquire(&pgaud_state->lock);
-
-    next = (pgaud_state->head + 1) % PGAUD_QUEUE_SLOTS;
-    if (next == pgaud_state->tail)
-    {
-        // queue full 
-        ok = false;
-    }
-    else
-    {
-        // copy job into slot
-        pgaud_state->jobs[pgaud_state->head] = *job;
-        pgaud_state->head = next;
-        ok = true;
-    }
-
-    SpinLockRelease(&pgaud_state->lock);
-    return ok;
-}
-
-/* Dequeue job (worker side). Returns true & fills out on success. */
-static bool
-pgaud_dequeue_job(PGAudJob *out)
-{
-    bool ok = false;
-
-    if (!pgaud_state)
-        return false;
-
-    SpinLockAcquire(&pgaud_state->lock);
-
-    if (pgaud_state->head == pgaud_state->tail)
-    {
-        ok = false;
-    }
-    else
-    {
-        *out = pgaud_state->jobs[pgaud_state->tail];
-        pgaud_state->tail = (pgaud_state->tail + 1) % PGAUD_QUEUE_SLOTS;
-        ok = true;
-    }
-
-    SpinLockRelease(&pgaud_state->lock);
-    return ok;
-}
-
-
-// insert_into_log_immediate - this prepares data and puts it into 
-// shared memory and then sends a signal to wake up the worker 
-void insert_into_log_immediate(const char *app, const char *db, int pid,
-                          const char *start_time, const char *end_time, const char *err)
-{
-    PGAudJob job;
-    char err_escaped[PGAUD_ERR_LEN];
-    char startbuf[PGAUD_TIME_LEN];
-    char endbuf[PGAUD_TIME_LEN];
-
-    if (start_time && start_time[0] != '\0')
-        strlcpy(startbuf, start_time, sizeof(startbuf));
-    else
-        format_now_timestamp(startbuf, sizeof(startbuf));
-
-    if (end_time && end_time[0] != '\0')
-        strlcpy(endbuf, end_time, sizeof(endbuf));
-    else
-        strlcpy(endbuf, startbuf, sizeof(endbuf));
-
-    // filling job fields safely 
-    job.job_type = PGAUD_JOB_BACKUP_LOG;
-
-    
-    strlcpy(job.application, app ? app : "(unknown)", sizeof(job.application));
-    strlcpy(job.database, db ? db : "", sizeof(job.database));
-
-    job.pid = pid;
-
-    strlcpy(job.start_time, startbuf, sizeof(job.start_time));
-    strlcpy(job.end_time, endbuf, sizeof(job.end_time));
-
-   
-    escape_single_quotes(err ? err : "", err_escaped, sizeof(err_escaped));
-    strlcpy(job.err, err_escaped, sizeof(job.err));
-
-    // strlcpy(job.client_addr, client_addr ? client_addr : "", sizeof(job.client_addr));
-  
-   
-    if (!pgaud_enqueue_job(&job))
-    {
-        elog(WARNING, "[pg_backup_compliance] job queue full or unavailable; dropped log for app=%s pid=%d",
-             job.application, job.pid);
-        return;
-    } else{
-        elog(LOG,"[pg_backup_compliance] Job added to queue for app=%s pid=%d",job.application, job.pid);
-    }
-
-    // if (pgaud_state && pgaud_state->worker_pid > 0)
-    // {
-        #if PG_VERSION_NUM < 170000
-                SendProcSignal(pgaud_state->worker_pid,
-                            PGAUD_PROC_SIGNAL,
-                            MyBackendId);
-            #else
-                SendProcSignal(pgaud_state->worker_pid,
-                            PGAUD_PROC_SIGNAL,
-                            MyBackendType);
-            #endif
-    // }
-    return;
-}
-
-
-/* 
-    This hook only triggers at the end of a dump/basebackup/backrest session to log the event    
-    those ends with FATAL/ERROR/PANIC/PGERROR 
-
-    This helps in catching those sessions that fails without even calling the hooks 
-    or ends in console errors.
-*/
-
-static void
-pgaud_emit_log_hook(ErrorData *edata)
-{
-    static bool in_hook = false;
-    const char *app;
-    // 1. Call the previous hook in the chain if it exists 
-    if (prev_emit_log_hook)
-        prev_emit_log_hook(edata);
-
-    // 2. Recursion Guard: Prevent infinite loops if our logic errors out 
-    // in_hook = false;
-    // elog(LOG, "[pg_backup_compliance_dump] In emit_log_hook with elevel=%d", edata->elevel);
-    write_stderr("[pgaud_dump] In emit_log_hook with elevel=%d\n", edata->elevel);
-    if (in_hook)
-        return;
-
-    
-    // 3. Filter: Only process ERROR, FATAL, or PANIC
-    /* Inside your log hook */
-
- 
-    if (edata->elevel >= ERROR || 
-        (edata->message && strstr(edata->message, "terminating connection due to administrator command")) ||
-        (edata->message && strstr(edata->message, "aborted")))
-    {
-        /* Mark this row as having an error in your table */
-    } 
-    else if (edata->elevel < ERROR)
-        return;
-
-    in_hook = true;
-    // write_stderr("[pgaud_dump] In emit_log_hook with elevel=%d qnd now writing.\n", edata->elevel);
-
-    // 4. Filter: Only process specific applications (pg_dump / pg_basebackup) 
-    app = (MyProcPort && MyProcPort->application_name)
-                        ? MyProcPort->application_name
-                        : "";
-    
-    // write_stderr("[pgaud_dump] Application name in emit_log_hook: %s\n", app);
-
-    if (strncmp(app, "pg_dump", 7) == 0 || strncmp(app, "pg_basebackup", 13) == 0)
-    {
-        PGAudJob job;
-        const char *db;
-        TimestampTz now;
-        const char *now_str;
-
-        // Safe database name lookup 
-        db = (OidIsValid(MyDatabaseId)) ? get_database_name(MyDatabaseId) : "";
-
-        memset(&job, 0, sizeof(PGAudJob));
-        job.job_type = PGAUD_JOB_BACKUP_LOG;
-        
-        strlcpy(job.application, app, PGAUD_APP_LEN);
-        strlcpy(job.database, db ? db : "", PGAUD_DB_LEN);
-        job.pid = MyProcPid;
-
-        now = GetCurrentTimestamp();
-        now_str = timestamptz_to_str(now);
-        strlcpy(job.start_time, now_str, PGAUD_TIME_LEN);
-        strlcpy(job.end_time, now_str, PGAUD_TIME_LEN);
-
-        // Extract error message from edata 
-        if (edata->message)
-            escape_single_quotes(edata->message, job.err, PGAUD_ERR_LEN);
-        else
-            strlcpy(job.err, "unknown error/termination", PGAUD_ERR_LEN);
-
-        /* * Use write_stderr for internal extension debugging. 
-         * Calling elog(LOG) inside an error hook can be risky.
-         */
-        write_stderr("[pgaud_dump] Enqueuing error job for app=%s\n", app);
-
-        // 5. Enqueue and Notify
-        if (pgaud_enqueue_job(&job))
-        {
-            if (pgaud_state && pgaud_state->worker_pid != 0)
-            {
-                #if PG_VERSION_NUM < 170000
-                    SendProcSignal(pgaud_state->worker_pid, PGAUD_PROC_SIGNAL, MyBackendId);
-                #else
-                    SendProcSignal(pgaud_state->worker_pid, PGAUD_PROC_SIGNAL, MyBackendType);
-                #endif
-            }
-        }
-    }
-
-    in_hook = false;
-}
-
-
-
-// Handle a backup log job: insert or update the log entry.
-static void
-pgaud_handle_backup_log(PGAudJob *job)
-{
-    elog(LOG, "[pg_backup_compliance] Worker inserting job for pid=%d", job->pid);
-    // CHECK_FOR_INTERRUPTS();
-
-    PG_TRY();
-    {
-        int rc;
-        char sql_chk[256];
-        char sql[2048];
-        bool exists = false;
-        elog(LOG, "[pg_backup_compliance] Worker processing backup log for pid=%d",
-             job->pid);
-        /* ---- CHECK EXISTENCE ---- */
-        
-        snprintf(sql_chk, sizeof(sql_chk),
-                 "SELECT COUNT(*) FROM backup_operations_log WHERE backend_pid=%d",
-                 job->pid);
-
-        rc = SPI_execute(sql_chk, true, 1);
-        
-        elog(LOG, "[pg_backup_compliance] SPI_execute returned rc=%d for pid=%d", rc, job->pid);
-        if (rc != SPI_OK_SELECT)
-            elog(ERROR, "SPI_execute failed (check)");
-
-        elog(LOG, "[pg_backup_compliance] SPI_processed=%lu for pid=%d", SPI_processed, job->pid);
-        if (SPI_processed == 1)
-        {
-            bool isnull;
-            Datum d = SPI_getbinval(
-                SPI_tuptable->vals[0],
-                SPI_tuptable->tupdesc,
-                1,
-                &isnull);
-
-            exists = (!isnull && DatumGetInt32(d) > 0);
-        }
-        elog(LOG, "[pg_backup_compliance] Log existence for pid=%d: %s",
-             job->pid, exists ? "yes" : "no");
-        /* ---- INSERT OR UPDATE ---- */
-        
-
-        if (exists)
-        {
-            snprintf(sql, sizeof(sql),
-                "UPDATE backup_operations_log "
-                "SET end_time='%s', error='%s' "
-                "WHERE backend_pid=%d",
-                job->end_time,
-                job->err,
-                job->pid);
-        }
-        else
-        {
-            snprintf(sql, sizeof(sql),
-                "INSERT INTO backup_operations_log "
-                "(application_name, database_name, backend_pid, start_time, end_time, error) "
-                "VALUES ('%s','%s',%d,'%s','%s','%s')",
-                job->application,
-                job->database,
-                job->pid,
-                job->start_time,
-                job->end_time,
-                job->err);
-        }
-        elog(LOG, "[pg_backup_compliance] Executing SQL for pid=%d: %s", job->pid, sql);
-        rc = SPI_execute(sql, false, 0);
-        if (rc != SPI_OK_INSERT && rc != SPI_OK_UPDATE)
-            elog(ERROR, "SPI_execute failed (insert/update)");
-
-        elog(LOG, "[pg_backup_compliance] Log written for pid=%d", job->pid);
-    }
-    PG_CATCH();
-    {
-        /* DO NOT abort transaction here */
-        elog(WARNING,
-             "[pg_backup_compliance] Worker failed to insert log for pid=%d",
-             job->pid);
-
-        FlushErrorState();
-    }
-    PG_END_TRY();
-}
-
-
-void
-pgaud_run_schema(void)
-{
-   
-
-    const char *cmds[]={
-        "DO $$ BEGIN "
-        "IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'log_method') THEN "
-        "   CREATE TYPE public.log_method AS ENUM ("
-        "       'archive-push','backup','restore','check','stanza-create','stanza-upgrade'"
-        "   ); "
-        "END IF; "
-        "END $$;",
-
-        "CREATE TABLE IF NOT EXISTS public.backup_operations_log ("
-        "   id SERIAL PRIMARY KEY,"
-        "   application_name TEXT NOT NULL,"
-        "   start_time TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,"
-        "   end_time TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,"
-        "   database_name TEXT NOT NULL,"
-        "   error TEXT,"
-        "   backend_pid INTEGER NOT NULL"
-        ");",
-
-        "CREATE INDEX IF NOT EXISTS idx_backup_log_pid "
-        "ON public.backup_operations_log (backend_pid);",
-
-        "GRANT SELECT, INSERT ON public.backup_operations_log TO public;",
-        "GRANT USAGE, SELECT ON SEQUENCE public.backup_operations_log_id_seq TO public;",
-        NULL
-    };;
-
-     elog(LOG, "[pg_backup_compliance] Running schema creation in backupcompliance");
-    
-    // StartTransactionCommand();
-    // PushActiveSnapshot(GetTransactionSnapshot());
-
-    // if (SPI_connect() != SPI_OK_CONNECT)
-    //     elog(ERROR, "[pg_backup_compliance] worker schema SPI_connect failed");
-
-    // elog(LOG, "[pg_backup_compliance] connected to SPI for schema creation");
-
-
-    elog(LOG, "[pg_backup_compliance] executing schema commands");
-    for (int i = 0; cmds[i] != NULL; i++)
-    {
-        int ret = SPI_execute(cmds[i], false, 0);
-        if (ret != SPI_OK_UTILITY)
-            elog(WARNING, "[pg_backup_compliance] SPI_execute failed: %s", cmds[i]);
-    }
-
-    // SPI_finish();
-
-    /* End transaction */
-    // PopActiveSnapshot();
-    // CommitTransactionCommand();
-
-    elog(LOG, "[pg_backup_compliance] schema created or already existed");
-}
-
-void
-pgaud_run_views_schema(void)
-{
-   
-    const char *cmds[] = {
-
-        "CREATE OR REPLACE VIEW v_quarterly_backups AS "
-        "SELECT * "
-        "FROM backup_operations_log "
-        "WHERE application_name IN ('pg_dump', 'pg_basebackup', 'pgbackrest','pg_dumpall') "
-        "AND start_time >= date_trunc('quarter', CURRENT_DATE);",
-
-        "GRANT SELECT ON v_quarterly_backups TO public;",
-
-        "CREATE OR REPLACE VIEW v_monthly_backups AS "
-        "SELECT * "
-        "FROM backup_operations_log "
-        "WHERE application_name IN ('pg_dump', 'pg_basebackup', 'pgbackrest','pg_dumpall') "
-        "AND start_time >= date_trunc('month', CURRENT_DATE);",
-
-        "GRANT SELECT ON v_monthly_backups TO public;",
-
-        "CREATE OR REPLACE VIEW v_failed_backups AS "
-        "SELECT * "
-        "FROM backup_operations_log "
-        "WHERE application_name IN ('pg_dump', 'pg_basebackup', 'pgbackrest','pg_dumpall') "
-        "AND error IS NOT NULL "
-        "AND length(trim(error)) > 0;",
-
-        "GRANT SELECT ON v_failed_backups TO public;",
-
-        "CREATE OR REPLACE VIEW v_quarterly_failed_backups AS "
-        "SELECT * "
-        "FROM backup_operations_log "
-        "WHERE application_name IN ('pg_dump', 'pg_basebackup', 'pgbackrest','pg_dumpall') "
-        "AND error IS NOT NULL "
-        "AND length(trim(error)) > 0 "
-        "AND start_time >= date_trunc('quarter', CURRENT_DATE);",
-
-        "GRANT SELECT ON v_quarterly_failed_backups TO public;",
-
-        "CREATE OR REPLACE VIEW v_monthly_failed_backups AS "
-        "SELECT * "
-        "FROM backup_operations_log "
-        "WHERE application_name IN ('pg_dump', 'pg_basebackup', 'pgbackrest','pg_dumpall') "
-        "AND error IS NOT NULL "
-        "AND length(trim(error)) > 0 "
-        "AND start_time >= date_trunc('month', CURRENT_DATE);",
-
-        "GRANT SELECT ON v_monthly_failed_backups TO public;",
-        NULL
-    };
-    int ret;
-
-     
-    
-    elog(LOG, "[pg_backup_compliance] executing views creation commands");
-    for (int i = 0; cmds[i] != NULL; i++)
-    {
-        elog(LOG, "Executing SQL: %s", cmds[i]);
-
-        ret = SPI_execute(cmds[i], false, 0);
-        if (ret != SPI_OK_UTILITY)
-            elog(WARNING, "[pg_backup_compliance] SPI_execute failed: %s", cmds[i]);
-    }
-
-    elog(LOG, "[pg_backup_compliance] views created or already existed");
-}
-
-
-static void
-pgaud_bgw_sigterm(SIGNAL_ARGS)
-{
-    int save_errno = errno;
-
-    got_sigterm = true;
-
-    if (MyProc)
-        SetLatch(&MyProc->procLatch);
-
-    errno = save_errno;
-}
-
-/*
- * Signal handler for SIGHUP
- *      Set a flag to tell the main loop to reread the config file, and set
- *      our latch to wake it up.
- */
-static void pgaud_bgw_sighup(SIGNAL_ARGS) {
-    int         save_errno = errno;
-
-    got_sighup = true;
-
-    if (MyProc)
-        SetLatch(&MyProc->procLatch);
-
-    errno = save_errno;
-}
-
-
-static bool
-pgaud_schema_exists(void)
-{
-    Oid nsp_oid = get_namespace_oid("public", true);
-
-    if (!OidIsValid(nsp_oid))
-        return false;
-
-    return SearchSysCacheExists2(
-        RELNAMENSP,
-        CStringGetDatum("backup_operations_log"),
-        ObjectIdGetDatum(nsp_oid)
-    );
-}
-
-
-
-void
-pgaud_worker_main(Datum arg)
-{
-    int rc;
-    PGAudJob job;
-    bool schema_initialized = false;
-    // TimestampTz last_cleanup = GetCurrentTimestamp();
-
-    pqsignal(SIGHUP, pgaud_bgw_sighup);
-    pqsignal(SIGTERM, pgaud_bgw_sigterm);
-
-    BackgroundWorkerUnblockSignals();
-
-
-    /* ---- CONNECT TO BACKUP DATABASE ---- */
-    BackgroundWorkerInitializeConnection(BACKUP_DATABASE, NULL, 0);
-    elog(LOG, "[pg_backup_compliance] connected to backupcompliance");
-
-    for (;;)
-    {
-        /* ---- WAIT FOR LATCH / SHUTDOWN ---- */
-        rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-                       PGAUD_WORKER_POLL_MS,
-                       PG_WAIT_EXTENSION);
-
-        ResetLatch(MyLatch);
-        CHECK_FOR_INTERRUPTS();
-
-        if (rc & WL_POSTMASTER_DEATH || got_sigterm)
-        {
-            elog(LOG, "[pg_backup_compliance] BGWorker received shutdown signal, exiting");
-            proc_exit(0);
-        }
-
-        /* ---- SCHEMA INIT ---- */
-        if (!schema_initialized)
-        {
-            PG_TRY();
-            {
-                StartTransactionCommand();
-                PushActiveSnapshot(GetTransactionSnapshot());
-                CHECK_FOR_INTERRUPTS();
-
-                if (!pgaud_schema_exists())
-                {
-                    elog(LOG, "[pg_backup_compliance] initializing schema");
-
-                    if (SPI_connect() == SPI_OK_CONNECT)
-                    {
-                        pgaud_run_schema();  // function does SPI_execute internally
-                        CHECK_FOR_INTERRUPTS();
-                        pgaud_run_views_schema(); // create views
-                        SPI_finish();
-                    }
-                    else
-                    {
-                        elog(WARNING, "[pg_backup_compliance] SPI_connect failed during schema init");
-                    }
-
-                    elog(LOG, "[pg_backup_compliance] schema initialization done");
-                }
-
-                PopActiveSnapshot();
-                CommitTransactionCommand();
-                schema_initialized = true;
-            }
-            PG_CATCH();
-            {
-                AbortCurrentTransaction();
-                PopActiveSnapshot();
-                FlushErrorState();
-                elog(WARNING, "[pg_backup_compliance] Schema init failed, will retry next loop");
-            }
-            PG_END_TRY();
-        }
-
-        // if (GetCurrentTimestamp() - last_cleanup > 30 * 1000000L)
-        // {
-           
-        //     PG_TRY();
-        //     {
-        //         StartTransactionCommand();
-        //         PushActiveSnapshot(GetTransactionSnapshot()); // REQUIRED for CTE
-        //         pgaud_clean_up_basebackup_c();
-        //         PopActiveSnapshot();
-        //         CommitTransactionCommand();
-        //         last_cleanup=GetCurrentTimestamp();
-        //     }
-        //     PG_CATCH();
-        //     {
-        //         AbortCurrentTransaction();
-        //         FlushErrorState();
-        //     }
-        //     PG_END_TRY();
-        // }
-
-        /* ---- PROCESS JOBS ---- */
-        while (pgaud_dequeue_job(&job))
-        {
-            PG_TRY();
-            {
-                StartTransactionCommand();
-                PushActiveSnapshot(GetTransactionSnapshot());
-                CHECK_FOR_INTERRUPTS();
-                elog(LOG, "[pg_backup_compliance] Worker dequeued job of type=%d for pid=%d",
-                     job.job_type, job.pid);
-                switch (job.job_type)
-                {
-                    case PGAUD_JOB_BACKUP_LOG:
-                        elog(LOG, "[pg_backup_compliance] Worker processing backup log for pid=%d",
-                             job.pid);
-
-                        if (SPI_connect() == SPI_OK_CONNECT)
-                        {
-                            pgaud_handle_backup_log(&job); // now safe to execute SPI
-                            SPI_finish();
-                        }
-                        else
-                        {
-                            elog(WARNING, "[pg_backup_compliance] SPI_connect failed for backup log pid=%d",
-                                 job.pid);
-                        }
-                        break;
-
-                    case PGAUD_JOB_SCHEMA_CREATE:
-                        elog(LOG, "[pg_backup_compliance] Worker running schema creation job");
-
-                        if (SPI_connect() == SPI_OK_CONNECT)
-                        {
-                            pgaud_run_schema();
-                            SPI_finish();
-                        }
-                        else
-                        {
-                            elog(WARNING, "[pg_backup_compliance] SPI_connect failed during schema creation job");
-                        }
-                        break;
-
-                    default:
-                        elog(WARNING, "[pg_backup_compliance] Unknown job type %d", job.job_type);
-                        break;
-                }
-
-                PopActiveSnapshot();
-                CommitTransactionCommand();
-            }
-            PG_CATCH();
-            {
-                AbortCurrentTransaction();
-                PopActiveSnapshot();
-                FlushErrorState();
-                elog(WARNING, "[pg_backup_compliance] Job failed, will continue next job");
-            }
-            PG_END_TRY();
-
-            CHECK_FOR_INTERRUPTS();
-            if (got_sigterm)
-            {
-                elog(LOG, "[pg_backup_compliance] BGWorker received shutdown signal during job, exiting");
-                proc_exit(0);
-            }
-        }
-    }
-}
-
-
-// This function checks if backupcompliance database is available or not
-// If not found cretes the datatabase
-// Similarly, it creates two tables, backup_operations_log and pgbackrest_logs
-// IF tables exists in backupcompliance database, it skips
-// We need a global database to keep data.
-
-Datum
-pgaud_init(PG_FUNCTION_ARGS)
-{
-    elog(LOG, "[pg_backup_compliance] pgaud_init() started");
-
-    if (!database_exists("backupcompliance"))
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_UNDEFINED_DATABASE),
-                errmsg("backupcompliance database does not exist. Please create it before using this extension.")));
-    }else
-    {
-        elog(LOG, "[pg_backup_compliance] backupcompliance already exists");
-    }
-
-    PG_RETURN_VOID();
-}
+/* Forward declarations for static functions. */
+static void pgbc_shmem_request(void);
+static void pgbc_shmem_startup(void);
+static void pgbc_shmem_shutdown(int code, Datum arg);
+static Size pgbc_memsize(void);
+static void pgbc_load_dump_file(void);
+static void pgbc_save_dump_file(void);
+static void pgbc_evict_one_locked(void);
+static void pgbc_archive_entry(const pgbcEntry *entry);
+static void pgbc_truncate_archive(void);
+static const char *pgbc_status_name(pgbcStatus s);
+static Tuplestorestate *pgbc_make_tupstore(FunctionCallInfo fcinfo,
+                                           TupleDesc *tupdesc_p);
+static void pgbc_put_entry_tuple(Tuplestorestate *tupstore,
+                                 TupleDesc tupdesc,
+                                 const pgbcEntry *snap);
+static void pgbc_archive_to_tupstore(Tuplestorestate *tupstore,
+                                     TupleDesc tupdesc);
+
+/* Public extension functions. */
+PG_FUNCTION_INFO_V1(pg_backup_compliance_operations);
+PG_FUNCTION_INFO_V1(pg_backup_compliance_archived_operations);
+PG_FUNCTION_INFO_V1(pg_backup_compliance_reset);
+PG_FUNCTION_INFO_V1(pg_backup_compliance_info);
+
+void _PG_init(void);
+void _PG_fini(void);
 
 void
 _PG_init(void)
 {
-
-    BackgroundWorker worker;
+    /* Shared memory can only be requested from shared_preload_libraries. */
     if (!process_shared_preload_libraries_in_progress)
+    {
+        ereport(WARNING,
+                (errmsg("pg_backup_compliance must be loaded via "
+                        "shared_preload_libraries to be effective"),
+                 errhint("Add \"pg_backup_compliance\" to shared_preload_libraries "
+                         "in postgresql.conf and restart the server.")));
         return;
+    }
 
-    elog(LOG, "[pg_backup_compliance] _PG_init_dump() registering error context");
+    /* GUCs */
+    DefineCustomBoolVariable("pg_backup_compliance.enabled",
+                             "Enable / disable backup-compliance capture.",
+                             NULL,
+                             &pgbc_enabled,
+                             true,
+                             PGC_SIGHUP,
+                             0,
+                             NULL, NULL, NULL);
 
+    DefineCustomBoolVariable("pg_backup_compliance.save",
+                             "Save state across server restarts.",
+                             NULL,
+                             &pgbc_save,
+                             true,
+                             PGC_SIGHUP,
+                             0,
+                             NULL, NULL, NULL);
 
-    prev_emit_log_hook = emit_log_hook;
-    emit_log_hook = pgaud_emit_log_hook;
+    DefineCustomIntVariable("pg_backup_compliance.max_entries",
+                            "Maximum concurrent / recent backup operations "
+                            "tracked in shared memory.",
+                            NULL,
+                            &pgbc_max_entries,
+                            1024,
+                            64,
+                            INT_MAX / 2,
+                            PGC_POSTMASTER,
+                            0,
+                            NULL, NULL, NULL);
 
-    elog(LOG, "[pg_backup_compliance] _PG_init() called: registering dump hooks");
-    _PG_init_dump();   
-    
-    // Allocating shared memory and lock
+    DefineCustomStringVariable("pg_backup_compliance.track_apps",
+                               "Comma-separated, case-insensitive list of "
+                               "application_name prefixes treated as backup "
+                               "tools.",
+                               NULL,
+                               &pgbc_track_apps,
+                               "pg_dump,pg_dumpall,pg_basebackup,"
+                               "pgbackrest,pgBackRest",
+                               PGC_SIGHUP,
+                               0,
+                               NULL, NULL, NULL);
+
+    MarkGUCPrefixReserved("pg_backup_compliance");
+
+    /* Chain through any pre-existing shmem hooks. */
+#if PG_VERSION_NUM >= 150000
     prev_shmem_request_hook = shmem_request_hook;
-    shmem_request_hook = pgaud_shmem_request;
-    // RequestNamedLWLockTranche("pgaud_queue_tranche", 1);
+    shmem_request_hook = pgbc_shmem_request;
+#else
+    pgbc_shmem_request();
+#endif
 
-    // shared memory startup hook
     prev_shmem_startup_hook = shmem_startup_hook;
-    shmem_startup_hook = pgaud_shmem_startup;
+    shmem_startup_hook = pgbc_shmem_startup;
 
-    // Executor hook for dump commands
-    
-    
-    // GUC to enable/disable the bgworker logging
-
-    // DefineCustomBoolVariable(
-    //     "pg_backup_compliance.enable",
-    //     "Enable or disable pg_backup_compliance background worker",
-    //     NULL,
-    //     &pgaud_enabled,
-    //     true,                       /* default */
-    //     PGC_SIGHUP,                 /* reloadable */
-    //     0,
-    //     NULL,
-    //     NULL,
-    //     NULL
-    // );
-
-  
-    // Registering BGWorker for deferred logging    
-    
-    memset(&worker, 0, sizeof(worker));
-    worker.bgw_flags =
-        BGWORKER_SHMEM_ACCESS |
-        BGWORKER_BACKEND_DATABASE_CONNECTION;
-    worker.bgw_start_time = BgWorkerStart_ConsistentState;
-    worker.bgw_restart_time = BGW_NEVER_RESTART;  /* restart every 5 seconds if crash */
-    snprintf(worker.bgw_name, BGW_MAXLEN, "pgaud_log_worker");
-    snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_backup_compliance");
-    snprintf(worker.bgw_function_name, BGW_MAXLEN, "pgaud_worker_main");
-    worker.bgw_notify_pid = 0;
-    RegisterBackgroundWorker(&worker);
-    elog(LOG, "[pg_backup_compliance] Background worker registered successfully");
-
-    elog(LOG, "[pg_backup_compliance] _PG_init_dump() registering error context");
-
+    pgbc_capture_init();
 }
 
-//  _PG_fini: cleanup, unregister hooks.
 void
 _PG_fini(void)
 {
-    elog(LOG, "[pg_backup_compliance] _PG_fini() called: unloading dump hooks");
-    _PG_fini_dump();
-   
+    pgbc_capture_fini();
+
+#if PG_VERSION_NUM >= 150000
+    shmem_request_hook = prev_shmem_request_hook;
+#endif
+    shmem_startup_hook = prev_shmem_startup_hook;
 }
 
+/* Shared-memory management. */
 
+static Size
+pgbc_memsize(void)
+{
+    Size        size;
+
+    size = MAXALIGN(sizeof(pgbcSharedState));
+    size = add_size(size, hash_estimate_size(pgbc_max_entries,
+                                             sizeof(pgbcEntry)));
+    return size;
+}
+
+static void
+pgbc_shmem_request(void)
+{
+#if PG_VERSION_NUM >= 150000
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+#endif
+
+    RequestAddinShmemSpace(pgbc_memsize());
+    RequestNamedLWLockTranche("pg_backup_compliance", 1);
+}
+
+static void
+pgbc_shmem_startup(void)
+{
+    bool        found;
+    HASHCTL     info;
+
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+    pgbc_state = NULL;
+    pgbc_hash = NULL;
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+    pgbc_state = (pgbcSharedState *)
+        ShmemInitStruct("pg_backup_compliance state",
+                        sizeof(pgbcSharedState),
+                        &found);
+    if (!found)
+    {
+        pgbc_state->lock = &(GetNamedLWLockTranche("pg_backup_compliance"))->lock;
+        SpinLockInit(&pgbc_state->mutex);
+        pgbc_state->sequence_counter = 0;
+        pgbc_state->total_captured = 0;
+        pgbc_state->total_evicted = 0;
+        pgbc_state->last_reset = GetCurrentTimestamp();
+    }
+
+    memset(&info, 0, sizeof(info));
+    info.keysize = sizeof(pgbcHashKey);
+    info.entrysize = sizeof(pgbcEntry);
+
+    pgbc_hash = ShmemInitHash("pg_backup_compliance hash",
+                              pgbc_max_entries,
+                              pgbc_max_entries,
+                              &info,
+                              HASH_ELEM | HASH_BLOBS);
+
+    LWLockRelease(AddinShmemInitLock);
+
+    /* Persist state on clean shutdown; reload it on next startup. */
+    if (!IsUnderPostmaster)
+        on_shmem_exit(pgbc_shmem_shutdown, (Datum) 0);
+
+    if (!IsUnderPostmaster && pgbc_save)
+        pgbc_load_dump_file();
+}
+
+static void
+pgbc_shmem_shutdown(int code, Datum arg)
+{
+    if (code)
+        return;                 /* skip dump on crash */
+
+    if (!pgbc_state || !pgbc_hash)
+        return;
+
+    if (!pgbc_save)
+        return;
+
+    pgbc_save_dump_file();
+}
+
+/* Persistence: load / save the dump file. */
+
+static void
+pgbc_load_dump_file(void)
+{
+    FILE       *file;
+    uint32      header;
+    uint32      pgver;
+    int32       num_entries;
+    int32       i;
+
+    file = AllocateFile(PGBC_DUMP_FILE, PG_BINARY_R);
+    if (file == NULL)
+    {
+        if (errno != ENOENT)
+            ereport(LOG,
+                    (errcode_for_file_access(),
+                     errmsg("could not open pg_backup_compliance dump "
+                            "file \"%s\": %m", PGBC_DUMP_FILE)));
+        return;
+    }
+
+    if (fread(&header, sizeof(uint32), 1, file) != 1 ||
+        fread(&pgver, sizeof(uint32), 1, file) != 1 ||
+        fread(&num_entries, sizeof(int32), 1, file) != 1)
+    {
+        ereport(LOG,
+                (errmsg("ignoring truncated pg_backup_compliance dump file")));
+        goto done;
+    }
+
+    if (header != PGBC_FILE_HEADER || pgver != PGBC_PG_MAJOR_VERSION)
+    {
+        ereport(LOG,
+                (errmsg("ignoring incompatible pg_backup_compliance "
+                        "dump file (header=0x%08x ver=%u)", header, pgver)));
+        goto done;
+    }
+
+    for (i = 0; i < num_entries; i++)
+    {
+        pgbcEntry   tmp;
+        pgbcEntry  *entry;
+        bool        found;
+
+        if (fread(&tmp, sizeof(pgbcEntry), 1, file) != 1)
+        {
+            ereport(LOG,
+                    (errmsg("ignoring truncated pg_backup_compliance "
+                            "dump file at entry %d", i)));
+            break;
+        }
+
+        entry = (pgbcEntry *) hash_search(pgbc_hash, &tmp.key,
+                                          HASH_ENTER_NULL, &found);
+        if (entry == NULL)
+            break;              /* hash table full */
+
+        memcpy(entry, &tmp, sizeof(pgbcEntry));
+        SpinLockInit(&entry->mutex);
+        if (entry->status == PGBC_STATUS_RUNNING)
+        {
+            entry->status = PGBC_STATUS_INTERRUPTED;
+            if (entry->end_time == 0)
+                entry->end_time = GetCurrentTimestamp();
+            if (entry->error_message[0] == '\0')
+                strlcpy(entry->error_message,
+                        "PostgreSQL server restarted before operation completed",
+                        sizeof(entry->error_message));
+        }
+    }
+
+done:
+    FreeFile(file);
+
+    /* Unlink so basebackups and standbys do not carry stale state. */
+    unlink(PGBC_DUMP_FILE);
+}
+
+static void
+pgbc_save_dump_file(void)
+{
+    FILE       *file;
+    HASH_SEQ_STATUS hash_seq;
+    pgbcEntry  *entry;
+    int32       num_entries;
+    uint32      header = PGBC_FILE_HEADER;
+    uint32      pgver = PGBC_PG_MAJOR_VERSION;
+
+    /* The permanent stats dir normally exists, but be defensive. */
+    (void) MakePGDirectory(PGSTAT_STAT_PERMANENT_DIRECTORY);
+
+    file = AllocateFile(PGBC_DUMP_FILE_TMP, PG_BINARY_W);
+    if (file == NULL)
+    {
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("could not write pg_backup_compliance dump file "
+                        "\"%s\": %m", PGBC_DUMP_FILE_TMP)));
+        return;
+    }
+
+    num_entries = hash_get_num_entries(pgbc_hash);
+
+    if (fwrite(&header, sizeof(uint32), 1, file) != 1 ||
+        fwrite(&pgver, sizeof(uint32), 1, file) != 1 ||
+        fwrite(&num_entries, sizeof(int32), 1, file) != 1)
+        goto write_error;
+
+    hash_seq_init(&hash_seq, pgbc_hash);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL)
+    {
+        if (fwrite(entry, sizeof(pgbcEntry), 1, file) != 1)
+        {
+            hash_seq_term(&hash_seq);
+            goto write_error;
+        }
+    }
+
+    if (FreeFile(file) != 0)
+    {
+        file = NULL;
+        goto write_error;
+    }
+
+    (void) durable_rename(PGBC_DUMP_FILE_TMP, PGBC_DUMP_FILE, LOG);
+    return;
+
+write_error:
+    ereport(LOG,
+            (errcode_for_file_access(),
+             errmsg("could not finalise pg_backup_compliance dump file: %m")));
+    if (file)
+        FreeFile(file);
+    unlink(PGBC_DUMP_FILE_TMP);
+}
+
+/* Persistence: the append-only archive of evicted entries. */
+
+/*
+ * Append one entry to the durable archive before it leaves the hash.  Caller
+ * holds pgbc_state->lock EXCLUSIVE; a failed write is truncated back so a torn
+ * record cannot corrupt the records that follow it.
+ */
+static void
+pgbc_archive_entry(const pgbcEntry *entry)
+{
+    FILE       *file;
+    struct stat st;
+    off_t       prev_size = 0;
+    bool        need_header;
+
+    /* The permanent stats dir normally exists, but be defensive. */
+    (void) MakePGDirectory(PGSTAT_STAT_PERMANENT_DIRECTORY);
+
+    if (stat(PGBC_ARCHIVE_FILE, &st) == 0)
+        prev_size = st.st_size;
+    need_header = (prev_size == 0);
+
+    file = AllocateFile(PGBC_ARCHIVE_FILE, PG_BINARY_A);
+    if (file == NULL)
+    {
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("could not open pg_backup_compliance archive file "
+                        "\"%s\": %m", PGBC_ARCHIVE_FILE)));
+        return;
+    }
+
+    if (need_header)
+    {
+        uint32      header = PGBC_ARCHIVE_HEADER;
+        uint32      pgver = PGBC_PG_MAJOR_VERSION;
+
+        if (fwrite(&header, sizeof(uint32), 1, file) != 1 ||
+            fwrite(&pgver, sizeof(uint32), 1, file) != 1)
+            goto write_error;
+    }
+
+    if (fwrite(entry, sizeof(pgbcEntry), 1, file) != 1)
+        goto write_error;
+
+    /* Compliance data must survive an OS crash, not just a backend exit. */
+    if (fflush(file) != 0)
+        goto write_error;
+    if (pg_fsync(fileno(file)) != 0)
+        goto write_error;
+
+    if (FreeFile(file) != 0)
+    {
+        file = NULL;
+        goto write_error;
+    }
+    return;
+
+write_error:
+    ereport(LOG,
+            (errcode_for_file_access(),
+             errmsg("could not append to pg_backup_compliance archive file "
+                    "\"%s\": %m", PGBC_ARCHIVE_FILE)));
+    if (file)
+    {
+        /* Roll back any partial record so later reads stay aligned. */
+        (void) fflush(file);
+        if (ftruncate(fileno(file), prev_size) != 0)
+            ereport(LOG,
+                    (errcode_for_file_access(),
+                     errmsg("could not truncate pg_backup_compliance archive "
+                            "file \"%s\": %m", PGBC_ARCHIVE_FILE)));
+        FreeFile(file);
+    }
+}
+
+/* Remove the archive file.  Caller holds pgbc_state->lock EXCLUSIVE. */
+static void
+pgbc_truncate_archive(void)
+{
+    if (unlink(PGBC_ARCHIVE_FILE) != 0 && errno != ENOENT)
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("could not remove pg_backup_compliance archive file "
+                        "\"%s\": %m", PGBC_ARCHIVE_FILE)));
+}
+
+/* Hash-table helpers (called from the capture unit). */
+
+/*
+ * Evict one entry from the hash (caller holds pgbc_state->lock EXCLUSIVE).
+ * Prefer the least-used terminal entry, else the oldest running one.
+ */
+static void
+pgbc_evict_one_locked(void)
+{
+    HASH_SEQ_STATUS hash_seq;
+    pgbcEntry  *entry;
+    pgbcEntry  *victim = NULL;
+    uint32      victim_usage = UINT32_MAX;
+    bool        terminal_only = true;
+
+    hash_seq_init(&hash_seq, pgbc_hash);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL)
+    {
+        if (entry->status != PGBC_STATUS_RUNNING && entry->usage <= victim_usage)
+        {
+            victim = entry;
+            victim_usage = entry->usage;
+        }
+    }
+
+    if (victim == NULL)
+    {
+        terminal_only = false;
+        hash_seq_init(&hash_seq, pgbc_hash);
+        while ((entry = hash_seq_search(&hash_seq)) != NULL)
+        {
+            if (entry->usage <= victim_usage)
+            {
+                victim = entry;
+                victim_usage = entry->usage;
+            }
+        }
+    }
+
+    if (victim != NULL)
+    {
+        /* Persist the victim before removing it so it is never lost. */
+        pgbc_archive_entry(victim);
+
+        (void) hash_search(pgbc_hash, &victim->key, HASH_REMOVE, NULL);
+        if (pgbc_state)
+        {
+            SpinLockAcquire(&pgbc_state->mutex);
+            pgbc_state->total_evicted++;
+            SpinLockRelease(&pgbc_state->mutex);
+        }
+        if (!terminal_only)
+            ereport(LOG,
+                    (errmsg("pg_backup_compliance: evicting a running entry "
+                            "because hash table is full"),
+                     errhint("Increase pg_backup_compliance.max_entries.")));
+    }
+}
+
+pgbcEntry *
+pgbc_lookup_or_create_entry(int pid, TimestampTz backend_start, bool create)
+{
+    pgbcHashKey key;
+    pgbcEntry  *entry;
+    bool        found;
+
+    if (!pgbc_state || !pgbc_hash)
+        return NULL;
+
+    memset(&key, 0, sizeof(key));   /* zero padding for HASH_BLOBS keys */
+    key.backend_pid = pid;
+    key.backend_start = backend_start;
+
+    if (!create)
+    {
+        LWLockAcquire(pgbc_state->lock, LW_SHARED);
+        entry = (pgbcEntry *) hash_search(pgbc_hash, &key, HASH_FIND, &found);
+        LWLockRelease(pgbc_state->lock);
+        return found ? entry : NULL;
+    }
+
+    LWLockAcquire(pgbc_state->lock, LW_EXCLUSIVE);
+
+    entry = (pgbcEntry *) hash_search(pgbc_hash, &key, HASH_ENTER_NULL, &found);
+    if (entry == NULL)
+    {
+        pgbc_evict_one_locked();
+        entry = (pgbcEntry *) hash_search(pgbc_hash, &key, HASH_ENTER_NULL, &found);
+    }
+
+    if (entry != NULL && !found)
+    {
+        memset(((char *) entry) + sizeof(pgbcHashKey),
+               0,
+               sizeof(pgbcEntry) - sizeof(pgbcHashKey));
+        entry->key = key;
+        SpinLockInit(&entry->mutex);
+        entry->status = PGBC_STATUS_UNKNOWN;
+
+        SpinLockAcquire(&pgbc_state->mutex);
+        entry->usage = ++pgbc_state->sequence_counter;
+        pgbc_state->total_captured++;
+        SpinLockRelease(&pgbc_state->mutex);
+    }
+
+    LWLockRelease(pgbc_state->lock);
+    return entry;
+}
+
+/* Compare two strings, treating NULL as the empty string. */
+static bool
+pgbc_streq(const char *a, const char *b)
+{
+    if (a == NULL)
+        a = "";
+    if (b == NULL)
+        b = "";
+    return strcmp(a, b) == 0;
+}
+
+/*
+ * Does a connecting backend belong to an already-running operation?  Any
+ * pg_dump is treated as part of a pg_dumpall while one is running.
+ */
+static bool
+pgbc_type_folds_into(const char *child_type, const char *parent_type)
+{
+    if (child_type == NULL)
+        child_type = "";
+    if (parent_type == NULL)
+        parent_type = "";
+
+    /* pg_dumpall's child pg_dumps, or members sharing its name. */
+    if (pg_strcasecmp(child_type, parent_type) == 0)
+        return true;
+    if (pg_strcasecmp(parent_type, "pg_dumpall") == 0 &&
+        pg_strcasecmp(child_type, "pg_dump") == 0)
+        return true;
+
+    return false;
+}
+
+/* Multi-connection tools whose first connection starts a shared entry. */
+static bool
+pgbc_type_starts_aggregate(const char *backup_type)
+{
+    if (backup_type == NULL)
+        return false;
+    if (pg_strcasecmp(backup_type, "pg_dumpall") == 0)
+        return true;
+    if (pg_strcasecmp(backup_type, "pg_basebackup") == 0)
+        return true;
+    return false;
+}
+
+/*
+ * Fold this backend into a running multi-connection operation, or start a new
+ * shared entry if it is the umbrella connection.  Returns NULL when the type
+ * does not aggregate, so the caller uses a per-backend entry.
+ */
+pgbcEntry *
+pgbc_attach_aggregate_entry(const char *appname,
+                            const char *dbname,
+                            const char *username,
+                            const char *client_addr,
+                            const char *backup_type,
+                            bool is_walsender)
+{
+    HASH_SEQ_STATUS hash_seq;
+    pgbcEntry  *entry;
+    pgbcEntry  *match = NULL;
+    pgbcHashKey key;
+    bool        found;
+
+    if (!pgbc_state || !pgbc_hash)
+        return NULL;
+    if (appname == NULL || appname[0] == '\0')
+        return NULL;
+
+    LWLockAcquire(pgbc_state->lock, LW_EXCLUSIVE);
+
+    /* Match on client + user; the database differs per child. */
+    hash_seq_init(&hash_seq, pgbc_hash);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL)
+    {
+        if (entry->aggregated &&
+            entry->status == PGBC_STATUS_RUNNING &&
+            pgbc_streq(entry->client_addr, client_addr) &&
+            pgbc_streq(entry->user_name, username) &&
+            pgbc_type_folds_into(backup_type, entry->backup_type))
+        {
+            match = entry;
+            hash_seq_term(&hash_seq);
+            break;
+        }
+    }
+
+    if (match != NULL)
+    {
+        SpinLockAcquire(&match->mutex);
+        match->refcount++;
+        match->conn_count++;
+        SpinLockRelease(&match->mutex);
+        LWLockRelease(pgbc_state->lock);
+        return match;
+    }
+
+    /* Only multi-connection tools start a shared entry. */
+    if (!pgbc_type_starts_aggregate(backup_type))
+    {
+        LWLockRelease(pgbc_state->lock);
+        return NULL;
+    }
+
+    /* This is the umbrella connection: create the shared entry. */
+    memset(&key, 0, sizeof(key));   /* zero padding for HASH_BLOBS keys */
+    key.backend_pid = MyProcPid;
+    key.backend_start = MyStartTimestamp;
+
+    entry = (pgbcEntry *) hash_search(pgbc_hash, &key, HASH_ENTER_NULL, &found);
+    if (entry == NULL)
+    {
+        pgbc_evict_one_locked();
+        entry = (pgbcEntry *) hash_search(pgbc_hash, &key, HASH_ENTER_NULL,
+                                          &found);
+    }
+
+    if (entry == NULL)
+    {
+        LWLockRelease(pgbc_state->lock);
+        return NULL;
+    }
+
+    if (found)
+    {
+        /* Already created for this backend; just reuse it. */
+        SpinLockAcquire(&entry->mutex);
+        if (entry->aggregated)
+        {
+            entry->refcount++;
+            entry->conn_count++;
+        }
+        SpinLockRelease(&entry->mutex);
+        LWLockRelease(pgbc_state->lock);
+        return entry;
+    }
+
+    memset(((char *) entry) + sizeof(pgbcHashKey),
+           0,
+           sizeof(pgbcEntry) - sizeof(pgbcHashKey));
+    entry->key = key;
+    SpinLockInit(&entry->mutex);
+
+    if (appname)
+        strlcpy(entry->application_name, appname,
+                sizeof(entry->application_name));
+    if (dbname)
+        strlcpy(entry->database_name, dbname, sizeof(entry->database_name));
+    if (username)
+        strlcpy(entry->user_name, username, sizeof(entry->user_name));
+    if (client_addr)
+        strlcpy(entry->client_addr, client_addr, sizeof(entry->client_addr));
+    if (backup_type)
+        strlcpy(entry->backup_type, backup_type, sizeof(entry->backup_type));
+
+    entry->is_walsender = is_walsender;
+    entry->start_time = (MyStartTimestamp != 0) ? MyStartTimestamp
+                                                : GetCurrentTimestamp();
+    entry->status = PGBC_STATUS_RUNNING;
+    entry->aggregated = true;
+    entry->refcount = 1;
+    entry->conn_count = 1;
+
+    SpinLockAcquire(&pgbc_state->mutex);
+    entry->usage = ++pgbc_state->sequence_counter;
+    pgbc_state->total_captured++;
+    SpinLockRelease(&pgbc_state->mutex);
+
+    LWLockRelease(pgbc_state->lock);
+    return entry;
+}
+
+void
+pgbc_entry_mark_running(pgbcEntry *entry,
+                        const char *appname,
+                        const char *dbname,
+                        const char *username,
+                        const char *client_addr,
+                        const char *backup_type,
+                        bool is_walsender,
+                        TimestampTz start_time)
+{
+    if (entry == NULL)
+        return;
+
+    SpinLockAcquire(&entry->mutex);
+    if (appname)
+        strlcpy(entry->application_name, appname,
+                sizeof(entry->application_name));
+    if (dbname)
+        strlcpy(entry->database_name, dbname,
+                sizeof(entry->database_name));
+    if (username)
+        strlcpy(entry->user_name, username, sizeof(entry->user_name));
+    if (client_addr)
+        strlcpy(entry->client_addr, client_addr,
+                sizeof(entry->client_addr));
+    if (backup_type)
+        strlcpy(entry->backup_type, backup_type,
+                sizeof(entry->backup_type));
+    entry->is_walsender = is_walsender;
+    if (start_time != 0)
+        entry->start_time = start_time;
+    else if (entry->start_time == 0)
+        entry->start_time = GetCurrentTimestamp();
+    entry->status = PGBC_STATUS_RUNNING;
+    SpinLockRelease(&entry->mutex);
+}
+
+void
+pgbc_entry_record_error(pgbcEntry *entry, const char *msg)
+{
+    if (entry == NULL || msg == NULL)
+        return;
+
+    SpinLockAcquire(&entry->mutex);
+    if (entry->error_message[0] == '\0')
+        strlcpy(entry->error_message, msg, sizeof(entry->error_message));
+    SpinLockRelease(&entry->mutex);
+}
+
+void
+pgbc_entry_mark_aborted(pgbcEntry *entry)
+{
+    if (entry == NULL)
+        return;
+
+    SpinLockAcquire(&entry->mutex);
+    entry->backup_aborted = true;
+    SpinLockRelease(&entry->mutex);
+}
+
+/*
+ * Downgrade a would-be success to failure when terminal evidence says the
+ * backup did not produce a usable result.  Must hold entry->mutex.
+ */
+static pgbcStatus
+pgbc_apply_terminal_downgrade(pgbcEntry *entry, pgbcStatus status)
+{
+    if (status != PGBC_STATUS_SUCCEEDED)
+        return status;
+
+    /* Backup aborted before pg_backup_stop() (e.g. pgBackRest archive timeout). */
+    if (entry->backup_aborted)
+    {
+        if (entry->error_message[0] == '\0')
+            strlcpy(entry->error_message,
+                    "backup aborted before pg_backup_stop was called",
+                    sizeof(entry->error_message));
+        return PGBC_STATUS_FAILED;
+    }
+
+    /* Walsender that neither streamed WAL nor ran a base backup sent nothing. */
+    if (entry->is_walsender && !entry->data_sent)
+    {
+        if (entry->error_message[0] == '\0')
+            strlcpy(entry->error_message,
+                    "backup connection closed without sending any data",
+                    sizeof(entry->error_message));
+        return PGBC_STATUS_FAILED;
+    }
+
+    return status;
+}
+
+void
+pgbc_entry_finalize(pgbcEntry *entry,
+                    pgbcStatus status,
+                    int32 exit_code,
+                    TimestampTz end_time)
+{
+    if (entry == NULL)
+        return;
+
+    SpinLockAcquire(&entry->mutex);
+
+    if (!entry->aggregated)
+    {
+        status = pgbc_apply_terminal_downgrade(entry, status);
+        entry->status = status;
+        entry->exit_code = exit_code;
+        entry->end_time = (end_time != 0) ? end_time : GetCurrentTimestamp();
+        SpinLockRelease(&entry->mutex);
+        return;
+    }
+
+    /* One member exiting: remember a failure, but wait for the last. */
+    if (status != PGBC_STATUS_SUCCEEDED && entry->status == PGBC_STATUS_RUNNING)
+    {
+        entry->status = status;
+        entry->exit_code = exit_code;
+    }
+
+    if (entry->refcount > 0)
+        entry->refcount--;
+
+    if (entry->refcount <= 0)
+    {
+        if (entry->status == PGBC_STATUS_RUNNING)
+        {
+            /* No member failed; judge no-data now that all have reported. */
+            status = pgbc_apply_terminal_downgrade(entry, status);
+            entry->status = status;
+            entry->exit_code = exit_code;
+        }
+        entry->end_time = (end_time != 0) ? end_time : GetCurrentTimestamp();
+    }
+
+    SpinLockRelease(&entry->mutex);
+}
+
+/* Track-apps GUC parsing. */
+
+static bool
+str_starts_with_ci(const char *s, const char *prefix, size_t prefix_len)
+{
+    size_t i;
+
+    if (s == NULL || prefix == NULL)
+        return false;
+    for (i = 0; i < prefix_len; i++)
+    {
+        char a = s[i];
+        char b = prefix[i];
+
+        if (a == '\0')
+            return false;
+        if (a >= 'A' && a <= 'Z')
+            a = a - 'A' + 'a';
+        if (b >= 'A' && b <= 'Z')
+            b = b - 'A' + 'a';
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+/* pgBackRest app names look like "pgBackRest [<command>]"; only backups count. */
+static bool
+pgbc_pgbackrest_is_backup(const char *appname)
+{
+    static const char backup_cmd[] = "backup";
+    const size_t backup_len = sizeof(backup_cmd) - 1;
+    const char *cmd;
+    char        after;
+
+    cmd = strchr(appname, '[');
+    if (cmd == NULL)
+        return false;
+
+    cmd++;
+    while (*cmd == ' ' || *cmd == '\t')
+        cmd++;
+
+    if (!str_starts_with_ci(cmd, backup_cmd, backup_len))
+        return false;
+
+    after = cmd[backup_len];
+    return (after == ']' || after == ' ' || after == '\t' || after == '\0');
+}
+
+bool
+pgbc_app_is_tracked(const char *appname, char *out_type, size_t out_type_len)
+{
+    const char *p;
+    size_t      app_len;
+    const char *best = NULL;
+    size_t      best_len = 0;
+
+    if (appname == NULL || appname[0] == '\0')
+        return false;
+    if (pgbc_track_apps == NULL || pgbc_track_apps[0] == '\0')
+        return false;
+
+    app_len = strlen(appname);
+    p = pgbc_track_apps;
+
+    while (*p)
+    {
+        const char *start;
+        const char *end;
+        size_t      tok_len;
+
+        while (*p == ' ' || *p == ',' || *p == '\t')
+            p++;
+        if (*p == '\0')
+            break;
+
+        start = p;
+        end = p;
+        while (*end && *end != ',' && *end != ' ' && *end != '\t')
+            end++;
+        tok_len = end - start;
+        p = end;
+
+        if (tok_len == 0)
+            continue;
+
+        /* Longest prefix match wins, so "pg_dumpall" beats "pg_dump". */
+        if (tok_len <= app_len && str_starts_with_ci(appname, start, tok_len) &&
+            tok_len > best_len)
+        {
+            best = start;
+            best_len = tok_len;
+        }
+    }
+
+    if (best == NULL)
+        return false;
+
+    /* Skip pgBackRest non-backup commands (check, stanza-create, ...). */
+    if (str_starts_with_ci(appname, "pgbackrest", strlen("pgbackrest")) &&
+        !pgbc_pgbackrest_is_backup(appname))
+        return false;
+
+    if (out_type && out_type_len > 0)
+    {
+        size_t      copy = best_len;
+
+        if (copy >= out_type_len)
+            copy = out_type_len - 1;
+        memcpy(out_type, best, copy);
+        out_type[copy] = '\0';
+    }
+    return true;
+}
+
+static const char *
+pgbc_status_name(pgbcStatus s)
+{
+    switch (s)
+    {
+        case PGBC_STATUS_RUNNING:     return "running";
+        case PGBC_STATUS_SUCCEEDED:   return "success";
+        case PGBC_STATUS_FAILED:      return "failed";
+        case PGBC_STATUS_INTERRUPTED: return "interrupted";
+        case PGBC_STATUS_AUTH_FAILED: return "auth_failed";
+        default:                      return "unknown";
+    }
+}
+
+/* SRF: pg_backup_compliance_operations() and _archived_operations(). */
+
+#define PGBC_NUM_COLS 14
+
+/* Validate the SRF call context and build the result tuplestore. */
+static Tuplestorestate *
+pgbc_make_tupstore(FunctionCallInfo fcinfo, TupleDesc *tupdesc_p)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc   tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext oldcontext;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+        (rsinfo->allowedModes & SFRM_Materialize) == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that "
+                        "cannot accept a set")));
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    *tupdesc_p = tupdesc;
+    return tupstore;
+}
+
+/* Emit one entry (a stable copy) as a row in the result tuplestore. */
+static void
+pgbc_put_entry_tuple(Tuplestorestate *tupstore, TupleDesc tupdesc,
+                     const pgbcEntry *snap)
+{
+    Datum       values[PGBC_NUM_COLS];
+    bool        nulls[PGBC_NUM_COLS];
+    int         i = 0;
+
+    memset(nulls, 0, sizeof(nulls));
+
+    values[i++] = Int32GetDatum(snap->key.backend_pid);
+    values[i++] = TimestampTzGetDatum(snap->key.backend_start);
+    values[i++] = CStringGetTextDatum(snap->application_name);
+    values[i++] = CStringGetTextDatum(snap->backup_type[0] ? snap->backup_type
+                                                           : snap->application_name);
+
+    if (snap->database_name[0])
+        values[i++] = CStringGetTextDatum(snap->database_name);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    if (snap->user_name[0])
+        values[i++] = CStringGetTextDatum(snap->user_name);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    if (snap->client_addr[0])
+        values[i++] = CStringGetTextDatum(snap->client_addr);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    values[i++] = BoolGetDatum(snap->is_walsender);
+
+    if (snap->start_time != 0)
+        values[i++] = TimestampTzGetDatum(snap->start_time);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    if (snap->end_time != 0)
+        values[i++] = TimestampTzGetDatum(snap->end_time);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    values[i++] = CStringGetTextDatum(pgbc_status_name(snap->status));
+    values[i++] = Int32GetDatum(snap->exit_code);
+
+    if (snap->error_message[0])
+        values[i++] = CStringGetTextDatum(snap->error_message);
+    else
+    { nulls[i] = true; values[i++] = (Datum) 0; }
+
+    /* Number of connections folded into this operation (>= 1). */
+    values[i++] = Int32GetDatum(snap->aggregated ? snap->conn_count : 1);
+
+    Assert(i == PGBC_NUM_COLS);
+
+    tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+}
+
+/*
+ * Read every archived (evicted) entry from disk into the result tuplestore.
+ * Caller holds pgbc_state->lock SHARED, excluding a concurrent append.
+ */
+static void
+pgbc_archive_to_tupstore(Tuplestorestate *tupstore, TupleDesc tupdesc)
+{
+    FILE       *file;
+    uint32      header;
+    uint32      pgver;
+
+    file = AllocateFile(PGBC_ARCHIVE_FILE, PG_BINARY_R);
+    if (file == NULL)
+    {
+        if (errno != ENOENT)
+            ereport(LOG,
+                    (errcode_for_file_access(),
+                     errmsg("could not read pg_backup_compliance archive file "
+                            "\"%s\": %m", PGBC_ARCHIVE_FILE)));
+        return;
+    }
+
+    if (fread(&header, sizeof(uint32), 1, file) != 1 ||
+        fread(&pgver, sizeof(uint32), 1, file) != 1)
+    {
+        /* Empty or header-only file: nothing to return. */
+        FreeFile(file);
+        return;
+    }
+
+    if (header != PGBC_ARCHIVE_HEADER || pgver != PGBC_PG_MAJOR_VERSION)
+    {
+        ereport(LOG,
+                (errmsg("ignoring incompatible pg_backup_compliance archive "
+                        "file (header=0x%08x ver=%u)", header, pgver)));
+        FreeFile(file);
+        return;
+    }
+
+    for (;;)
+    {
+        pgbcEntry   entry;
+
+        if (fread(&entry, sizeof(pgbcEntry), 1, file) != 1)
+            break;              /* EOF or trailing partial record */
+
+        pgbc_put_entry_tuple(tupstore, tupdesc, &entry);
+    }
+
+    FreeFile(file);
+}
+
+Datum
+pg_backup_compliance_operations(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Tuplestorestate *tupstore;
+    HASH_SEQ_STATUS hash_seq;
+    pgbcEntry  *entry;
+
+    tupstore = pgbc_make_tupstore(fcinfo, &tupdesc);
+
+    if (!pgbc_state || !pgbc_hash)
+        return (Datum) 0;
+
+    LWLockAcquire(pgbc_state->lock, LW_SHARED);
+
+    hash_seq_init(&hash_seq, pgbc_hash);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL)
+    {
+        pgbcEntry   snap;
+
+        SpinLockAcquire(&entry->mutex);
+        snap = *entry;
+        SpinLockRelease(&entry->mutex);
+
+        pgbc_put_entry_tuple(tupstore, tupdesc, &snap);
+    }
+
+    LWLockRelease(pgbc_state->lock);
+
+    return (Datum) 0;
+}
+
+/* Return only the archived (evicted) operations; unioned with the live SRF. */
+Datum
+pg_backup_compliance_archived_operations(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Tuplestorestate *tupstore;
+
+    tupstore = pgbc_make_tupstore(fcinfo, &tupdesc);
+
+    if (!pgbc_state)
+        return (Datum) 0;
+
+    LWLockAcquire(pgbc_state->lock, LW_SHARED);
+    pgbc_archive_to_tupstore(tupstore, tupdesc);
+    LWLockRelease(pgbc_state->lock);
+
+    return (Datum) 0;
+}
+
+Datum
+pg_backup_compliance_reset(PG_FUNCTION_ARGS)
+{
+    HASH_SEQ_STATUS hash_seq;
+    pgbcEntry  *entry;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser to reset "
+                        "pg_backup_compliance state")));
+
+    if (!pgbc_state || !pgbc_hash)
+        PG_RETURN_VOID();
+
+    LWLockAcquire(pgbc_state->lock, LW_EXCLUSIVE);
+
+    hash_seq_init(&hash_seq, pgbc_hash);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL)
+        (void) hash_search(pgbc_hash, &entry->key, HASH_REMOVE, NULL);
+
+    /* total_evicted is cleared below, so drop the archived rows too. */
+    pgbc_truncate_archive();
+
+    SpinLockAcquire(&pgbc_state->mutex);
+    pgbc_state->total_captured = 0;
+    pgbc_state->total_evicted = 0;
+    pgbc_state->sequence_counter = 0;
+    pgbc_state->last_reset = GetCurrentTimestamp();
+    SpinLockRelease(&pgbc_state->mutex);
+
+    LWLockRelease(pgbc_state->lock);
+
+    PG_RETURN_VOID();
+}
+
+Datum
+pg_backup_compliance_info(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Datum       values[4];
+    bool        nulls[4] = {false, false, false, false};
+    HeapTuple   tuple;
+    int64       captured = 0;
+    int64       evicted = 0;
+    TimestampTz last_reset = 0;
+    int32       live;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    if (pgbc_state)
+    {
+        SpinLockAcquire(&pgbc_state->mutex);
+        captured = pgbc_state->total_captured;
+        evicted = pgbc_state->total_evicted;
+        last_reset = pgbc_state->last_reset;
+        SpinLockRelease(&pgbc_state->mutex);
+    }
+    live = pgbc_hash ? hash_get_num_entries(pgbc_hash) : 0;
+
+    values[0] = Int32GetDatum(live);
+    values[1] = Int64GetDatum(captured);
+    values[2] = Int64GetDatum(evicted);
+    if (last_reset != 0)
+        values[3] = TimestampTzGetDatum(last_reset);
+    else
+        nulls[3] = true;
+
+    tuple = heap_form_tuple(tupdesc, values, nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}

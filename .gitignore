@@ -1,6 +1,17 @@
-.vscode
-dump.sql
-scope_lists.md
-# testing
-# impact_test.md
-temp.sql
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.bc
+
+# PGXS build output
+results/
+regression.diffs
+regression.out
+/tmp_check/
+/log/
+
+# Editor / OS noise
+*.swp
+.DS_Store

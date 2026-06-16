@@ -1,91 +1,164 @@
+# pg_backup_compliance
 
+A PostgreSQL extension that records every backup-related session against
+the server -- `pg_dump`, `pg_dumpall`, `pg_basebackup`, `pgBackRest`,
+`pg_probackup`, and any tool that calls the backup
+SQL API -- and exposes the captures as SQL views.
 
-Backup compliance plays a critical role in security and regulatory audits because data protection, availability, and recoverability are foundational aspects of information security. Most security frameworks and standards include explicit or implicit requirements for backup and recovery 
+## Features
 
-Strengthen your security posture with KloudDB Shield + pg_backup_compliance https://klouddb.gitbook.io/klouddb_shield
+* Tracks all backup utilities with a single, configurable allow-list
+  (`pg_backup_compliance.track_apps`).
+* Captures who, when, from where, how long, and the final status
+  (`success`, `failed`, `interrupted`, `auth_failed`).
+* Survives server restarts via a dump file in `$PGDATA/pg_stat/`.
+* `pg_monitor`-accessible views for the common "did backups happen?"
+  questions.
+* No third-party C dependencies; builds with PGXS on PostgreSQL 13+.
 
-## Why Do You Need This Extension for Backup Compliance?
+## Build and install
 
-1. In security and compliance frameworks such as ISO 27001, NIST, and HIPAA, organizations must maintain tamper-evident evidence proving that backups are being performed as required. This extension provides auditable records that serve as backup compliance proof.
+PostgreSQL server development headers are required.
 
-2. While it is possible to track pgBackRest, pg_basebackup, and pg_dump individually, there is no easy way to automatically and consistently track all three utilities together.
+On Debian / Ubuntu:
 
-3. One of the major security risks is unauthorized database exports using pg_dump. Tracking all backup and dump activity is critical for audits and for detecting potential data exfiltration.
-
-4. This extension includes built-in views that generate monthly and quarterly compliance reports, making audits significantly easier.
-
-5. Although backup activity can be inferred from logs, that evidence may be rotated or lost over time. This extension stores the evidence centrally and persistently.
-
-6. With this extension, you can quickly identify successful and failed backups across all supported tools for any given time period
-
-
-
-
-## Compile and Install
-
-
-1. Clone the extension
-
-2. Run the following in shell
-
+```sh
+sudo apt-get install postgresql-server-dev-$(pg_config --version | awk '{print $2}' | cut -d. -f1) libkrb5-dev
 ```
 
-make clean
+`libkrb5-dev` supplies GSSAPI headers required to build the capture module.
+
+On RHEL / Rocky / AlmaLinux:
+
+```sh
+sudo dnf install postgresqlNN-devel    # NN = your major version
+```
+
+Build:
+
+```sh
 make
 sudo make install
-
-```
-NOTE - You may need to install dependent packages (for example, on Ubuntu as shown below)
-
-apt install postgresql-server-dev-17 libkrb5-dev
-
-3. Add following to postgresql.conf and restart Postgres
-
 ```
 
+If you have multiple PostgreSQL major versions installed, point at the
+one you want:
+
+```sh
+make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install
+```
+
+## Configuration
+
+Add the library to `shared_preload_libraries` in `postgresql.conf`:
+
+```ini
 shared_preload_libraries = 'pg_backup_compliance'
-
 ```
 
+Restart the server, then install the SQL surface in whichever database
+you want to query from:
 
-
-4. Create the extension on the database to be tracked
-
-NOTE - A database named `backupcompliance` is needed by the extension
-
-
-Create database before installing extension
-
-```
-CREATE DATABASE backupcompliance;
-
-```
-
-```
-
+```sql
 CREATE EXTENSION pg_backup_compliance;
-
 ```
 
+### Known limitation
+> Because a `pg_dumpall` child and a standalone
+> `pg_dump` are protocol-identical, a genuine standalone `pg_dump` that runs
+> from the same host and user *while a `pg_dumpall` is in progress* is folded
+> into that `pg_dumpall`'s entry. This is unavoidable without cooperation
+> from the client.
 
-##  For pgbackrest integration
+## GUCs
 
-    1. Ensure the original pgbackrest binary exists at: /usr/bin/pgbackrest
-    
-    2. Run below command(for pgbackrest integration)
+| GUC | Default | Description |
+| --- | --- | --- |
+| `pg_backup_compliance.enabled` | `on` | Enable / disable capture. |
+| `pg_backup_compliance.save` | `on` | Persist state across restarts. |
+| `pg_backup_compliance.max_entries` | `1024` | Max operations tracked in shared memory. |
+| `pg_backup_compliance.track_apps` | `pg_dump,pg_dumpall,pg_basebackup,pgbackrest,pgBackRest` | `application_name` prefixes treated as backup tools. |
 
-   
-        sudo make pgbackrest_install
+## Usage
 
-  
+```sql
+-- Live in-memory view: every captured backup session.
+SELECT backend_pid, application_name, backup_type, status,
+       start_time, end_time, error_message
+  FROM pg_backup_compliance
+ ORDER BY start_time DESC
+ LIMIT 20;
 
-## Backup Reports(Built-in Views)
+-- Built-in convenience views.
+SELECT * FROM pg_backup_compliance_failed   ORDER BY start_time DESC;
+SELECT * FROM pg_backup_compliance_running;
+SELECT * FROM pg_backup_compliance_last_24h ORDER BY start_time DESC;
+```
 
-1. v_quarterly_backups          --> provides backups from last three months from now()
-2. v_monthly_backups            --> provides backups from last months from now()
-3. v_failed_backups             --> provides all failed backup attempts. 
-4. v_quarterly_failed_backups   -->  provides failed backups from last three months from now()
-5. v_monthly_failed_backups     --> provides failed backups from last months from now()
+### Time-windowed and failure views
 
+These views slice the live capture by recency and outcome, providing
+ready-made answers to common backup-compliance questions without writing
+ad-hoc predicates. They are thin wrappers over `pg_backup_compliance` and
+therefore expose the same column set; only the row filter differs.
 
+| View | Scope | Filter predicate |
+| --- | --- | --- |
+| `v_quarterly_backups` | All backups started in the last three months. | `start_time >= now() - interval '3 months'` |
+| `v_monthly_backups` | All backups started in the last month. | `start_time >= now() - interval '1 month'` |
+| `v_failed_backups` | Every unsuccessful backup attempt, regardless of age. | `status IN ('failed','interrupted','auth_failed')` |
+| `v_quarterly_failed_backups` | Unsuccessful attempts started in the last three months. | failed statuses `AND start_time >= now() - interval '3 months'` |
+| `v_monthly_failed_backups` | Unsuccessful attempts started in the last month. | failed statuses `AND start_time >= now() - interval '1 month'` |
 
+All five views are granted `SELECT` to the `pg_monitor` role and return the
+full column set of `pg_backup_compliance` (see [Columns](#columns) below).
+
+```sql
+-- Backups from the last three months.
+SELECT * FROM v_quarterly_backups ORDER BY start_time DESC;
+
+-- Backups from the last month.
+SELECT * FROM v_monthly_backups ORDER BY start_time DESC;
+
+-- All failed backup attempts.
+SELECT * FROM v_failed_backups ORDER BY start_time DESC;
+
+-- Failed backups from the last three months.
+SELECT * FROM v_quarterly_failed_backups ORDER BY start_time DESC;
+
+-- Failed backups from the last month.
+SELECT * FROM v_monthly_failed_backups ORDER BY start_time DESC;
+```
+
+> **Note:** Captures live in shared memory and are subject to eviction once
+> `pg_backup_compliance.max_entries` is exceeded. The quarterly and monthly
+> windows therefore report only the operations still resident in the cache,
+> not a guaranteed historical record across the full interval.
+
+#### Columns
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `backend_pid` | `int` | PID of the backend serving the backup session. |
+| `backend_start` | `timestamptz` | When the backend was started. |
+| `application_name` | `text` | Reported `application_name` of the client. |
+| `backup_type` | `text` | Backup category (e.g. `dump`, `dumpall`, `basebackup`). |
+| `database_name` | `text` | Target database. |
+| `user_name` | `text` | Role that initiated the backup. |
+| `client_addr` | `text` | Client network address. |
+| `is_walsender` | `boolean` | Whether the session is a WAL sender (physical backups). |
+| `start_time` | `timestamptz` | When the backup operation started. |
+| `end_time` | `timestamptz` | When it finished (`NULL` while running). |
+| `status` | `text` | `running`, `success`, `failed`, `interrupted`, or `auth_failed`. |
+| `exit_code` | `int` | Process exit code, when available. |
+| `error_message` | `text` | Failure detail for unsuccessful attempts. |
+| `connection_count` | `int` | Number of connections associated with the operation. |
+
+## Copyright
+
+Copyright (c) 2024-2026, KloudDB.
+
+Portions of the shared-memory and dump-file handling are derived from the
+PostgreSQL `pg_stat_statements` contrib module and remain
+Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
