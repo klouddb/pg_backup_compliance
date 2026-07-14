@@ -161,10 +161,10 @@ Currently, this extension is primarily designed to detect and track unauthorized
 
 For third-party backup tools such as pgBackRest, there are certain edge cases where failed backup attempts may not always be reported accurately. However, the extension can reliably monitor backup activity to detect unauthorized backup or dump operations across the following tools:
 
-pg_dump
-pg_dumpall
-pg_basebackup
-pgBackRest
+1) pg_dump
+2) pg_dumpall
+3) pg_basebackup
+4) pgBackRest
 
 ## Copyright
 
