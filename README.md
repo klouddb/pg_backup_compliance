@@ -155,6 +155,17 @@ SELECT * FROM v_monthly_failed_backups ORDER BY start_time DESC;
 | `error_message` | `text` | Failure detail for unsuccessful attempts. |
 | `connection_count` | `int` | Number of connections associated with the operation. |
 
+
+## Limitations
+Currently, this extension is primarily designed to detect and track unauthorized backup activity. For example, if someone initiates a backup outside the approved backup window, the extension can identify and report that activity.
+
+For third-party backup tools such as pgBackRest, there are certain edge cases where failed backup attempts may not always be reported accurately. However, the extension can reliably monitor backup activity to detect unauthorized backup or dump operations across the following tools:
+
+pg_dump
+pg_dumpall
+pg_basebackup
+pgBackRest
+
 ## Copyright
 
 Copyright (c) 2024-2026, KloudDB.
